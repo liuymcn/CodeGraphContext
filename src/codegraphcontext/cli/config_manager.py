@@ -151,13 +151,20 @@ def load_config() -> Dict[str, str]:
 
 def find_local_env() -> Optional[Path]:
     """
-    Find a local .env file by searching current directory and parents.
-    Returns the first .env file found, or None.
+    Find a local project config file by searching current directory and parents.
+    Priority: .codegraphcontext/config.env > .env (legacy)
+    Returns the first config file found, or None.
     """
     current = Path.cwd()
     
     # Search up to 5 levels up
     for _ in range(5):
+        # Prefer .codegraphcontext/config.env
+        cgc_config = current / ".codegraphcontext" / "config.env"
+        if cgc_config.exists():
+            return cgc_config
+        
+        # Fallback to .env (legacy/backward compat)
         env_file = current / ".env"
         if env_file.exists() and env_file != CONFIG_FILE:
             return env_file

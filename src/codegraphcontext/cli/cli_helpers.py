@@ -182,6 +182,11 @@ def index_helper(path: str):
         elapsed = time_end - time_start
         console.print(f"[green]Successfully finished indexing: {path} in {elapsed:.2f} seconds[/green]")
         
+        # Tip for project-level configuration
+        local_env = Path(path).resolve() / ".codegraphcontext" / "config.env"
+        if not local_env.exists():
+            console.print("[dim]💡 Tip: Run 'cgc config init' in your project to customize indexing settings.[/dim]")
+        
         # Check if auto-watch is enabled
         try:
             from codegraphcontext.cli.config_manager import get_config_value
