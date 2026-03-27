@@ -113,7 +113,16 @@ async def _run_index_with_progress(graph_builder: GraphBuilder, path_obj: Path, 
                 if job.total_files > 0:
                     progress.update(task_id, total=job.total_files, completed=job.processed_files)
                 
-                # Update the current filename in the UI
+                # Update stage description
+                stage = getattr(job, 'stage', None) or "indexing"
+                stage_labels = {
+                    "indexing": "Indexing...",
+                    "inheritance": "Resolving inheritance...",
+                    "function_calls": "Resolving function calls..."
+                }
+                progress.update(task_id, description=stage_labels.get(stage, stage))
+
+                # Update current filename
                 current_file = job.current_file or ""
                 if len(current_file) > 40:
                     current_file = "..." + current_file[-37:]
