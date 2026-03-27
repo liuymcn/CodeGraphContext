@@ -382,27 +382,40 @@ class GraphBuilder:
                 (file_data.get('properties',[]), 'Property'),
             ]
             for item_data, label in item_mappings:
-                for item in item_data:
-                    # Ensure cyclomatic_complexity is set for functions
-                    if label == 'Function' and 'cyclomatic_complexity' not in item:
-                        item['cyclomatic_complexity'] = 1 # Default value
+                if not item_data:
+                    continue
+                # Ensure cyclomatic_complexity is set for functions
+                if label == 'Function':
+                    for item in item_data:
+                        if 'cyclomatic_complexity' not in item:
+                            item['cyclomatic_complexity'] = 1
 
-                    query = f"""
-                        MATCH (f:File {{path: $path}})
-                        MERGE (n:{label} {{name: $name, path: $path, line_number: $line_number}})
-                        SET n += $props
-                        MERGE (f)-[:CONTAINS]->(n)
-                    """
+                # Batch write nodes with UNWIND
+                session.run(f"""
+                    UNWIND $items AS item
+                    MATCH (f:File {{path: $path}})
+                    MERGE (n:{label} {{name: item.name, path: $path, line_number: item.line_number}})
+                    SET n += item
+                    MERGE (f)-[:CONTAINS]->(n)
+                """, path=file_path_str, items=item_data)
 
-                    session.run(query, path=file_path_str, name=item['name'], line_number=item['line_number'], props=item)
-                    
-                    if label == 'Function':
+                # Batch write parameters for functions
+                if label == 'Function':
+                    params_batch = []
+                    for item in item_data:
                         for arg_name in item.get('args', []):
-                            session.run("""
-                                MATCH (fn:Function {name: $func_name, path: $path, line_number: $line_number})
-                                MERGE (p:Parameter {name: $arg_name, path: $path, function_line_number: $line_number})
-                                MERGE (fn)-[:HAS_PARAMETER]->(p)
-                            """, func_name=item['name'], path=file_path_str, line_number=item['line_number'], arg_name=arg_name)
+                            params_batch.append({
+                                'func_name': item['name'],
+                                'line_number': item['line_number'],
+                                'arg_name': arg_name
+                            })
+                    if params_batch:
+                        session.run("""
+                            UNWIND $params AS p
+                            MATCH (fn:Function {name: p.func_name, path: $path, line_number: p.line_number})
+                            MERGE (param:Parameter {name: p.arg_name, path: $path, function_line_number: p.line_number})
+                            MERGE (fn)-[:HAS_PARAMETER]->(param)
+                        """, path=file_path_str, params=params_batch)
 
             # --- NEW: persist Ruby Modules ---
             for m in file_data.get('modules', []):
@@ -746,13 +759,18 @@ class GraphBuilder:
                             MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
                         """, call_params)
 
-    def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict):
+    def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict, job_id: str = None):
         """Create CALLS relationships for all functions after all files have been processed."""
-        debug_log(f"_create_all_function_calls called with {len(all_file_data)} files")
+        total = len(all_file_data)
+        if job_id:
+            self.job_manager.update_job(job_id, stage="function_calls", total_files=total, processed_files=0, current_file="")
+        debug_log(f"_create_all_function_calls called with {total} files")
         with self.driver.session() as session:
             for idx, file_data in enumerate(all_file_data):
-                debug_log(f"Processing file {idx+1}/{len(all_file_data)}: {file_data.get('path', 'unknown')}")
+                debug_log(f"Processing file {idx+1}/{total}: {file_data.get('path', 'unknown')}")
                 self._create_function_calls(session, file_data, imports_map)
+                if job_id:
+                    self.job_manager.update_job(job_id, processed_files=idx + 1)
 
     def _create_inheritance_links(self, session, file_data: Dict, imports_map: dict):
         """Create INHERITS relationships with a more robust resolution logic."""
@@ -885,15 +903,20 @@ class GraphBuilder:
                         path=caller_file_path,
                         parent_name=base_name)
 
-    def _create_all_inheritance_links(self, all_file_data: list[Dict], imports_map: dict):
+    def _create_all_inheritance_links(self, all_file_data: list[Dict], imports_map: dict, job_id: str = None):
         """Create INHERITS relationships for all classes after all files have been processed."""
+        total = len(all_file_data)
+        if job_id:
+            self.job_manager.update_job(job_id, stage="inheritance", total_files=total, processed_files=0, current_file="")
         with self.driver.session() as session:
-            for file_data in all_file_data:
+            for idx, file_data in enumerate(all_file_data):
                 # Handle C# separately
                 if file_data.get('lang') == 'c_sharp':
                     self._create_csharp_inheritance_and_interfaces(session, file_data, imports_map)
                 else:
                     self._create_inheritance_links(session, file_data, imports_map)
+                if job_id:
+                    self.job_manager.update_job(job_id, processed_files=idx + 1)
                 
     def delete_file_from_graph(self, path: str):
         """Deletes a file and all its contained elements and relationships."""
@@ -1245,11 +1268,11 @@ class GraphBuilder:
                 curr = curr.parent
 
             spec = None
+            ignore_patterns = list(DEFAULT_IGNORE_PATTERNS)
             if cgcignore_path:
                 with open(cgcignore_path) as f:
                     user_patterns = [line.strip() for line in f.read().splitlines() if line.strip() and not line.strip().startswith('#')]
                 ignore_patterns = DEFAULT_IGNORE_PATTERNS + user_patterns
-                spec = pathspec.PathSpec.from_lines('gitwildmatch', ignore_patterns)
             else:
                 # No .cgcignore found — create one in the project root with default patterns
                 # so the user can see and customize what's being ignored
@@ -1264,7 +1287,21 @@ class GraphBuilder:
                     info_logger(f"Created default .cgcignore at {new_cgcignore}")
                 except OSError as e:
                     warning_logger(f"Could not create .cgcignore at {new_cgcignore}: {e}")
-                spec = pathspec.PathSpec.from_lines('gitwildmatch', DEFAULT_IGNORE_PATTERNS)
+
+            # Load .gitignore patterns if present (complements .cgcignore)
+            project_root = path.resolve() if path.is_dir() else path.resolve().parent
+            gitignore_path = project_root / ".gitignore"
+            if gitignore_path.exists():
+                try:
+                    with open(gitignore_path) as f:
+                        gitignore_patterns = [line.strip() for line in f.read().splitlines()
+                                              if line.strip() and not line.strip().startswith('#')]
+                    ignore_patterns = ignore_patterns + gitignore_patterns
+                    info_logger(f"Loaded {len(gitignore_patterns)} patterns from .gitignore")
+                except Exception as e:
+                    warning_logger(f"Could not load .gitignore: {e}")
+
+            spec = pathspec.PathSpec.from_lines('gitwildmatch', ignore_patterns)
 
             supported_extensions = self.parsers.keys()
             all_files = path.rglob("*") if path.is_dir() else [path]
@@ -1293,6 +1330,50 @@ class GraphBuilder:
                              kept_files.append(f)
                     files = kept_files
             
+            # Enforce MAX_FILE_SIZE_MB
+            max_file_size_mb = get_config_value("MAX_FILE_SIZE_MB")
+            if max_file_size_mb and max_file_size_mb != "unlimited":
+                try:
+                    max_bytes = float(max_file_size_mb) * 1024 * 1024
+                    before_count = len(files)
+                    files = [f for f in files if f.stat().st_size <= max_bytes]
+                    skipped = before_count - len(files)
+                    if skipped > 0:
+                        info_logger(f"Skipped {skipped} files exceeding {max_file_size_mb}MB")
+                except (ValueError, OSError) as e:
+                    warning_logger(f"Could not apply MAX_FILE_SIZE_MB filter: {e}")
+
+            # Enforce IGNORE_TEST_FILES
+            ignore_tests = (get_config_value("IGNORE_TEST_FILES") or "false").lower() == "true"
+            if ignore_tests and path.is_dir():
+                test_dir_names = {"test", "tests", "spec", "__tests__", "testing"}
+                before_count = len(files)
+                kept = []
+                for f in files:
+                    try:
+                        parts = set(p.lower() for p in f.relative_to(path).parts)
+                        if not parts.intersection(test_dir_names):
+                            kept.append(f)
+                    except ValueError:
+                        kept.append(f)
+                files = kept
+                skipped = before_count - len(files)
+                if skipped > 0:
+                    info_logger(f"Skipped {skipped} test files (IGNORE_TEST_FILES=true)")
+
+            # Enforce MAX_DEPTH
+            max_depth = get_config_value("MAX_DEPTH")
+            if max_depth and max_depth != "unlimited" and path.is_dir():
+                try:
+                    max_d = int(max_depth)
+                    before_count = len(files)
+                    files = [f for f in files if len(f.relative_to(path).parts) <= max_d]
+                    skipped = before_count - len(files)
+                    if skipped > 0:
+                        info_logger(f"Skipped {skipped} files beyond depth {max_d}")
+                except (ValueError, OSError) as e:
+                    warning_logger(f"Could not apply MAX_DEPTH filter: {e}")
+
             if spec:
                 filtered_files = []
                 for f in files:
@@ -1310,40 +1391,66 @@ class GraphBuilder:
             if job_id:
                 self.job_manager.update_job(job_id, total_files=len(files))
             
-            debug_log("Starting pre-scan to build imports map...")
-            imports_map = self._pre_scan_for_imports(files)
-            debug_log(f"Pre-scan complete. Found {len(imports_map)} definitions.")
-
+            # --- Single-pass parsing: parse all files first, then build imports_map, then write ---
+            debug_log("Starting single-pass parsing...")
             all_file_data = []
-
+            minimal_file_nodes = []
             processed_count = 0
+
             for file in files:
                 if file.is_file():
                     if job_id:
                         self.job_manager.update_job(job_id, current_file=str(file))
                     repo_path = path.resolve() if path.is_dir() else file.parent.resolve()
                     file_data = self.parse_file(repo_path, file, is_dependency)
-                    # Previously only files with supported extensions were indexed.
-                    # Updated to include all files so that unsupported file types
-                    # can still be represented as minimal File nodes in the graph.
                     if "error" not in file_data:
-                        self.add_file_to_graph(file_data, repo_name, imports_map)
                         all_file_data.append(file_data)
-
-                    # Previously only files with supported extensions were indexed.
-                    # Updated to include all files so that unsupported file types
-                    # can still be represented as minimal File nodes in the graph.
                     else:
-                        # create minimal node if parser not available
-                        self.add_minimal_file_node(file, repo_path, is_dependency)
+                        minimal_file_nodes.append((file, repo_path))
                     processed_count += 1
-
                     if job_id:
                         self.job_manager.update_job(job_id, processed_files=processed_count)
                     await asyncio.sleep(0.01)
 
-            self._create_all_inheritance_links(all_file_data, imports_map)
-            self._create_all_function_calls(all_file_data, imports_map)
+            debug_log(f"Parsed {len(all_file_data)} files. Building imports map...")
+
+            # Build imports_map from parsed data (replaces _pre_scan_for_imports)
+            imports_map = {}
+            for fd in all_file_data:
+                file_path_str = str(Path(fd['path']).resolve())
+                for func in fd.get('functions', []):
+                    name = func['name']
+                    if name not in imports_map:
+                        imports_map[name] = []
+                    imports_map[name].append(file_path_str)
+                for cls in fd.get('classes', []):
+                    name = cls['name']
+                    if name not in imports_map:
+                        imports_map[name] = []
+                    imports_map[name].append(file_path_str)
+                for iface in fd.get('interfaces', []):
+                    name = iface['name']
+                    if name not in imports_map:
+                        imports_map[name] = []
+                    imports_map[name].append(file_path_str)
+                for trait in fd.get('traits', []):
+                    name = trait['name']
+                    if name not in imports_map:
+                        imports_map[name] = []
+                    imports_map[name].append(file_path_str)
+
+            debug_log(f"Imports map built with {len(imports_map)} definitions. Writing to graph...")
+
+            # Write all parsed files to graph
+            for file_data in all_file_data:
+                self.add_file_to_graph(file_data, repo_name, imports_map)
+
+            # Write minimal nodes for unsupported files
+            for file, repo_p in minimal_file_nodes:
+                self.add_minimal_file_node(file, repo_p, is_dependency)
+
+            self._create_all_inheritance_links(all_file_data, imports_map, job_id=job_id)
+            self._create_all_function_calls(all_file_data, imports_map, job_id=job_id)
             
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.COMPLETED, end_time=datetime.now())
