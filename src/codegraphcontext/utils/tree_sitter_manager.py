@@ -236,8 +236,7 @@ def execute_query(language: Language, query_string: str, node):
     """
     Execute a tree-sitter query and return captures in backward-compatible format.
     
-    This function provides compatibility with the old tree-sitter 0.20.x API where
-    you could call query.captures(node). The new 0.25+ API uses QueryCursor.
+    Uses cached Query objects to avoid recompilation.
     
     Args:
         language: Tree-sitter Language object
@@ -246,40 +245,34 @@ def execute_query(language: Language, query_string: str, node):
         
     Returns:
         List of (node, capture_name) tuples, compatible with old API
-        
-    Example:
-        >>> from tree_sitter_language_pack import get_language
-        >>> lang = get_language('python')
-        >>> parser = Parser(lang)
-        >>> tree = parser.parse(b'def hello(): pass')
-        >>> captures = execute_query(lang, '(function_definition) @func', tree.root_node)
-        >>> for node, name in captures:
-        ...     print(f'{name}: {node.type}')
     """
     from tree_sitter import Query, QueryCursor
     
     try:
-        # Create query and cursor
-        query = Query(language, query_string)
+        # Cache compiled Query objects — same (language, query_string) only compiled once
+        cache_key = (id(language), query_string)
+        query = _query_cache.get(cache_key)
+        if query is None:
+            query = Query(language, query_string)
+            _query_cache[cache_key] = query
+        
         cursor = QueryCursor(query)
         
-        # Execute query and convert to old format
         captures = []
-        
-        # Use matches() which returns (pattern_index, captures_dict) tuples
         for pattern_index, captures_dict in cursor.matches(node):
-            # captures_dict is {capture_name: [nodes]}
             for capture_name, nodes in captures_dict.items():
                 for captured_node in nodes:
-                    # Old format: (node, capture_name)
                     captures.append((captured_node, capture_name))
         
         return captures
         
     except Exception as e:
-        # Provide helpful error message
         raise Exception(
             f"Failed to execute query: {e}\n"
             f"Query string: {query_string[:100]}..."
         )
+
+
+# Query compilation cache — same (language, query_string) pair only compiled once
+_query_cache = {}
 

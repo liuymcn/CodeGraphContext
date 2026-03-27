@@ -1351,10 +1351,17 @@ class GraphBuilder:
             supported_extensions = self.parsers.keys()
             all_files = path.rglob("*") if path.is_dir() else [path]
 
-            # Previously only files with supported extensions were indexed.
-            # Updated to include all files so that unsupported file types
-            # can still be represented as minimal File nodes in the graph.
-            files = [f for f in all_files if f.is_file()]
+            # Single stat() per entry — cache results to avoid repeated syscalls
+            import stat as stat_mod
+            file_stat_cache = {}  # Path -> os.stat_result
+            for f in all_files:
+                try:
+                    st = f.stat()
+                    if stat_mod.S_ISREG(st.st_mode):
+                        file_stat_cache[f] = st
+                except OSError:
+                    pass
+            files = list(file_stat_cache.keys())
 
             # Filter default ignored directories
             ignore_dirs_str = get_config_value("IGNORE_DIRS") or ""
@@ -1364,24 +1371,20 @@ class GraphBuilder:
                     kept_files = []
                     for f in files:
                         try:
-                            # Check if any parent directory in the relative path is in ignore list
                             parts = set(p.lower() for p in f.relative_to(path).parent.parts)
                             if not parts.intersection(ignore_dirs):
                                 kept_files.append(f)
-                            else:
-                                # debug_log(f"Skipping default ignored file: {f}")
-                                pass
                         except ValueError:
                              kept_files.append(f)
                     files = kept_files
             
-            # Enforce MAX_FILE_SIZE_MB
+            # Enforce MAX_FILE_SIZE_MB (uses cached stat)
             max_file_size_mb = get_config_value("MAX_FILE_SIZE_MB")
             if max_file_size_mb and max_file_size_mb != "unlimited":
                 try:
                     max_bytes = float(max_file_size_mb) * 1024 * 1024
                     before_count = len(files)
-                    files = [f for f in files if f.stat().st_size <= max_bytes]
+                    files = [f for f in files if file_stat_cache[f].st_size <= max_bytes]
                     skipped = before_count - len(files)
                     if skipped > 0:
                         info_logger(f"Skipped {skipped} files exceeding {max_file_size_mb}MB")
@@ -1460,9 +1463,8 @@ class GraphBuilder:
             changed_files = []
             unchanged_files = []
             for f in files:
-                if not f.is_file():
-                    continue
-                fp = self._file_fingerprint(f)
+                st = file_stat_cache.get(f)
+                fp = f"{st.st_mtime_ns}:{st.st_size}" if st else self._file_fingerprint(f)
                 cached_fp = repo_meta.get(str(f.resolve()))
                 if use_cache and repo_exists_in_db and cached_fp == fp:
                     unchanged_files.append(f)
