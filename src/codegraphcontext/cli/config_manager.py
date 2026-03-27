@@ -44,6 +44,8 @@ DEFAULT_CONFIG = {
     "SCIP_INDEXER": "false",
     "SCIP_LANGUAGES": "python,typescript,go,rust,java",
     "SKIP_EXTERNAL_RESOLUTION": "false",
+    "SKIP_FUNCTION_CALLS": "false",
+    "PARSE_CACHE_ENABLED": "false",
 }
 
 # Configuration key descriptions
@@ -71,6 +73,8 @@ CONFIG_DESCRIPTIONS = {
     "SCIP_INDEXER": "Use SCIP-based indexing for higher accuracy call/inheritance resolution (requires scip-<lang> tools installed)",
     "SCIP_LANGUAGES": "Comma-separated languages to index via SCIP when SCIP_INDEXER=true (python,typescript,go,rust,java)",
     "SKIP_EXTERNAL_RESOLUTION": "Skip resolution attempts for external library method calls (recommended for enterprise large Java/Spring codebases)",
+    "SKIP_FUNCTION_CALLS": "Skip function call relationship creation entirely (faster indexing when call graph is not needed)",
+    "PARSE_CACHE_ENABLED": "Cache parse results to ~/.codegraphcontext/cgc_cache/ for faster re-indexing",
 }
 
 # Valid values for each config key
@@ -88,6 +92,8 @@ CONFIG_VALIDATORS = {
     "INDEX_SOURCE": ["true", "false"],
     "SCIP_INDEXER": ["true", "false"],
     "SKIP_EXTERNAL_RESOLUTION": ["true", "false"],
+    "SKIP_FUNCTION_CALLS": ["true", "false"],
+    "PARSE_CACHE_ENABLED": ["true", "false"],
 }
 def ensure_config_dir(path: Path = CONFIG_DIR):
     """

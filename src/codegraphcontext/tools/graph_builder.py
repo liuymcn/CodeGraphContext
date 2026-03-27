@@ -1,6 +1,9 @@
 
 # src/codegraphcontext/tools/graph_builder.py
 import asyncio
+import hashlib
+import json as json_mod
+import os
 import pathspec
 from pathlib import Path
 from typing import Any, Coroutine, Dict, Optional, Tuple
@@ -13,7 +16,7 @@ from ..utils.debug_log import debug_log, info_logger, error_logger, warning_logg
 # New imports for tree-sitter (using tree-sitter-language-pack)
 from tree_sitter import Language, Parser
 from ..utils.tree_sitter_manager import get_tree_sitter_manager
-from ..cli.config_manager import get_config_value
+from ..cli.config_manager import get_config_value, CONFIG_DIR
 import fnmatch
  
 DEFAULT_IGNORE_PATTERNS = [
@@ -194,6 +197,83 @@ class GraphBuilder:
             except Exception as e:
                 warning_logger(f"Schema creation warning: {e}")
 
+    # --- #6: First-index CREATE optimization ---
+    def _is_db_empty(self) -> bool:
+        """Check if the database has no Repository nodes (first-time index)."""
+        try:
+            with self.driver.session() as session:
+                result = session.run("MATCH (r:Repository) RETURN count(r) AS c")
+                row = result.single()
+                return row is not None and row['c'] == 0
+        except Exception:
+            return False
+
+    # --- #8: Parse cache helpers ---
+    @staticmethod
+    def _get_cache_dir() -> Path:
+        d = CONFIG_DIR / "cgc_cache"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _cache_key(file_path: Path) -> str:
+        return hashlib.md5(str(file_path.resolve()).encode()).hexdigest()
+
+    @staticmethod
+    def _file_fingerprint(file_path: Path) -> str:
+        """mtime + size fingerprint for change detection."""
+        st = file_path.stat()
+        return f"{st.st_mtime_ns}:{st.st_size}"
+
+    def _load_cached_parse(self, file_path: Path) -> Optional[Dict]:
+        """Load cached parse result if file hasn't changed."""
+        cache_dir = self._get_cache_dir()
+        key = self._cache_key(file_path)
+        cache_file = cache_dir / f"{key}.json"
+        if not cache_file.exists():
+            return None
+        try:
+            data = json_mod.loads(cache_file.read_text(encoding='utf-8'))
+            if data.get('_fingerprint') == self._file_fingerprint(file_path):
+                data.pop('_fingerprint', None)
+                return data
+        except Exception:
+            pass
+        return None
+
+    def _save_parse_cache(self, file_path: Path, file_data: Dict):
+        """Save parse result to cache."""
+        cache_dir = self._get_cache_dir()
+        key = self._cache_key(file_path)
+        cache_file = cache_dir / f"{key}.json"
+        try:
+            to_save = file_data.copy()
+            to_save['_fingerprint'] = self._file_fingerprint(file_path)
+            cache_file.write_text(json_mod.dumps(to_save, default=str, ensure_ascii=False), encoding='utf-8')
+        except Exception as e:
+            debug_log(f"Failed to save parse cache for {file_path}: {e}")
+
+    # --- #5: Incremental indexing helpers ---
+    @staticmethod
+    def _get_index_meta_path() -> Path:
+        return CONFIG_DIR / "cgc_cache" / "_index_meta.json"
+
+    def _load_index_meta(self) -> Dict:
+        p = self._get_index_meta_path()
+        if p.exists():
+            try:
+                return json_mod.loads(p.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+        return {}
+
+    def _save_index_meta(self, meta: Dict):
+        p = self._get_index_meta_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.write_text(json_mod.dumps(meta, default=str, ensure_ascii=False), encoding='utf-8')
+        except Exception as e:
+            debug_log(f"Failed to save index meta: {e}")
 
     def _pre_scan_for_imports(self, files: list[Path]) -> dict:
         """Dispatches pre-scan to the correct language-specific implementation."""
@@ -309,13 +389,15 @@ class GraphBuilder:
             )
 
     # First pass to add file and its contents
-    def add_file_to_graph(self, file_data: Dict, repo_name: str, imports_map: dict):
+    def add_file_to_graph(self, file_data: Dict, repo_name: str, imports_map: dict, use_create: bool = False):
+        """Adds a file and its contents within a single, unified session."""
         calls_count = len(file_data.get('function_calls', []))
         debug_log(f"Executing add_file_to_graph for {file_data.get('path', 'unknown')} - Calls found: {calls_count}")
-        """Adds a file and its contents within a single, unified session."""
         file_path_str = str(Path(file_data['path']).resolve())
         file_name = Path(file_path_str).name
         is_dependency = file_data.get('is_dependency', False)
+        # #6: Use CREATE for first-time index, MERGE otherwise
+        write_cmd = "CREATE" if use_create else "MERGE"
 
         with self.driver.session() as session:
             try:
@@ -325,8 +407,8 @@ class GraphBuilder:
             except ValueError:
                 relative_path = file_name
 
-            session.run("""
-                MERGE (f:File {path: $path})
+            session.run(f"""
+                {write_cmd} (f:File {{path: $path}})
                 SET f.name = $name, f.relative_path = $relative_path, f.is_dependency = $is_dependency
             """, path=file_path_str, name=file_name, relative_path=relative_path, is_dependency=is_dependency)
 
@@ -349,9 +431,9 @@ class GraphBuilder:
                 
                 session.run(f"""
                     MATCH (p:{parent_label} {{path: $parent_path}})
-                    MERGE (d:Directory {{path: $current_path}})
+                    {write_cmd} (d:Directory {{path: $current_path}})
                     SET d.name = $part
-                    MERGE (p)-[:CONTAINS]->(d)
+                    {write_cmd} (p)-[:CONTAINS]->(d)
                 """, parent_path=parent_path, current_path=current_path_str, part=part)
 
                 parent_path = current_path_str
@@ -360,7 +442,7 @@ class GraphBuilder:
             session.run(f"""
                 MATCH (p:{parent_label} {{path: $parent_path}})
                 MATCH (f:File {{path: $path}})
-                MERGE (p)-[:CONTAINS]->(f)
+                {write_cmd} (p)-[:CONTAINS]->(f)
             """, parent_path=parent_path, path=file_path_str)
 
             # CONTAINS relationships for functions, classes, and variables
@@ -394,9 +476,9 @@ class GraphBuilder:
                 session.run(f"""
                     UNWIND $items AS item
                     MATCH (f:File {{path: $path}})
-                    MERGE (n:{label} {{name: item.name, path: $path, line_number: item.line_number}})
+                    {write_cmd} (n:{label} {{name: item.name, path: $path, line_number: item.line_number}})
                     SET n += item
-                    MERGE (f)-[:CONTAINS]->(n)
+                    {write_cmd} (f)-[:CONTAINS]->(n)
                 """, path=file_path_str, items=item_data)
 
                 # Batch write parameters for functions
@@ -410,11 +492,11 @@ class GraphBuilder:
                                 'arg_name': arg_name
                             })
                     if params_batch:
-                        session.run("""
+                        session.run(f"""
                             UNWIND $params AS p
-                            MATCH (fn:Function {name: p.func_name, path: $path, line_number: p.line_number})
-                            MERGE (param:Parameter {name: p.arg_name, path: $path, function_line_number: p.line_number})
-                            MERGE (fn)-[:HAS_PARAMETER]->(param)
+                            MATCH (fn:Function {{name: p.func_name, path: $path, line_number: p.line_number}})
+                            {write_cmd} (param:Parameter {{name: p.arg_name, path: $path, function_line_number: p.line_number}})
+                            {write_cmd} (fn)-[:HAS_PARAMETER]->(param)
                         """, path=file_path_str, params=params_batch)
 
             # --- NEW: persist Ruby Modules ---
@@ -651,8 +733,6 @@ class GraphBuilder:
             if caller_context and len(caller_context) == 3 and caller_context[0] is not None:
                 caller_name, _, caller_line_number = caller_context
                 
-                # KùzuDB workaround: Try Function->Function first, then other combinations
-                # This avoids polymorphic MERGE which KùzuDB doesn't support
                 call_params = {
                     'caller_name': caller_name,
                     'caller_file_path': caller_file_path,
@@ -664,63 +744,35 @@ class GraphBuilder:
                     'full_call_name': call.get('full_name', called_name)
                 }
                 
-                # Try Function caller -> Function callee
+                # #9: Merged COALESCE query — replaces 5-step cascade with 1 DB round-trip
+                # Priority: Function > Class for caller; Function > __init__ > Class for target
                 if not self._safe_run_create(session, """
-                    OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_file_path})
-                    OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
-                    WITH caller, called
-                    WHERE caller IS NOT NULL AND called IS NOT NULL
-                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    OPTIONAL MATCH (cf:Function {name: $caller_name, path: $caller_file_path})
+                    OPTIONAL MATCH (cc:Class {name: $caller_name, path: $caller_file_path})
+                    WITH COALESCE(cf, cc) AS caller
+                    WHERE caller IS NOT NULL
+                    OPTIONAL MATCH (tf:Function {name: $called_name, path: $called_file_path})
+                    OPTIONAL MATCH (tc:Class {name: $called_name, path: $called_file_path})
+                    OPTIONAL MATCH (tc)-[:CONTAINS]->(init:Function)
+                    WHERE init.name IN ["__init__", "constructor"]
+                    WITH caller, COALESCE(tf, init, tc) AS target
+                    WHERE target IS NOT NULL
+                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(target)
                     RETURN count(*) as created
                 """, call_params):
-                
-                    # Try Function caller -> Class callee (with __init__ resolution)
-                    if not self._safe_run_create(session, """
-                        OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_file_path})
-                        OPTIONAL MATCH (called:Class {name: $called_name, path: $called_file_path})
-                        OPTIONAL MATCH (called)-[:CONTAINS]->(init:Function)
-                        WHERE init.name IN ["__init__", "constructor"]
-                        WITH caller, COALESCE(init, called) as final_target
-                        WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
-                        RETURN count(*) as created
-                    """, call_params):
-                
-                        # Try Class caller -> Function callee
-                        if not self._safe_run_create(session, """
-                            OPTIONAL MATCH (caller:Class {name: $caller_name, path: $caller_file_path})
-                            OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
-                            WITH caller, called
-                            WHERE caller IS NOT NULL AND called IS NOT NULL
-                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                            RETURN count(*) as created
-                        """, call_params):
-                
-                            # Try Class caller -> Class callee
-                            if not self._safe_run_create(session, """
-                                OPTIONAL MATCH (caller:Class {name: $caller_name, path: $caller_file_path})
-                                OPTIONAL MATCH (called:Class {name: $called_name, path: $called_file_path})
-                                OPTIONAL MATCH (called)-[:CONTAINS]->(init:Function)
-                                WHERE init.name IN ["__init__", "constructor"]
-                                WITH caller, COALESCE(init, called) as final_target
-                                WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                                MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
-                                RETURN count(*) as created
-                            """, call_params):
-
-                                 # Fallback: Relaxed Global Search (Caller: Function/Class -> Callee: Function)
-                                 # Used when path resolution failed or was ambiguous
-                                 self._safe_run_create(session, """
-                                    OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_file_path}) 
-                                    OPTIONAL MATCH (callerClass:Class {name: $caller_name, path: $caller_file_path})
-                                    WITH COALESCE(caller, callerClass) as final_caller
-                                    OPTIONAL MATCH (called:Function {name: $called_name})
-                                    WITH final_caller, called
-                                    WHERE final_caller IS NOT NULL AND called IS NOT NULL
-                                    MERGE (final_caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                                """, call_params)
+                    # Fallback: global search without path constraint on callee
+                    self._safe_run_create(session, """
+                        OPTIONAL MATCH (cf:Function {name: $caller_name, path: $caller_file_path})
+                        OPTIONAL MATCH (cc:Class {name: $caller_name, path: $caller_file_path})
+                        WITH COALESCE(cf, cc) AS caller
+                        WHERE caller IS NOT NULL
+                        OPTIONAL MATCH (called:Function {name: $called_name})
+                        WITH caller, called
+                        WHERE called IS NOT NULL
+                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    """, call_params)
             else:
-                # File-level calls: Try Function first, then Class
+                # File-level calls
                 call_params = {
                     'caller_file_path': caller_file_path,
                     'called_name': called_name,
@@ -730,34 +782,27 @@ class GraphBuilder:
                     'full_call_name': call.get('full_name', called_name)
                 }
                 
+                # #9: Merged COALESCE for file-level calls
                 if not self._safe_run_create(session, """
                     OPTIONAL MATCH (caller:File {path: $caller_file_path})
-                    OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
-                    WITH caller, called
-                    WHERE caller IS NOT NULL AND called IS NOT NULL
-                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    WHERE caller IS NOT NULL
+                    OPTIONAL MATCH (tf:Function {name: $called_name, path: $called_file_path})
+                    OPTIONAL MATCH (tc:Class {name: $called_name, path: $called_file_path})
+                    OPTIONAL MATCH (tc)-[:CONTAINS]->(init:Function)
+                    WHERE init.name IN ["__init__", "constructor"]
+                    WITH caller, COALESCE(tf, init, tc) AS target
+                    WHERE target IS NOT NULL
+                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(target)
                     RETURN count(*) as created
                 """, call_params):
-                
-                    if not self._safe_run_create(session, """
+                    # Fallback: global search
+                    self._safe_run_create(session, """
                         OPTIONAL MATCH (caller:File {path: $caller_file_path})
-                        OPTIONAL MATCH (called:Class {name: $called_name, path: $called_file_path})
-                        OPTIONAL MATCH (called)-[:CONTAINS]->(init:Function)
-                        WHERE init.name IN ["__init__", "constructor"]
-                        WITH caller, COALESCE(init, called) as final_target
-                        WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
-                        RETURN count(*) as created
-                    """, call_params):
-
-                         # Fallback: Relaxed Global Search (Caller: File -> Callee: Function)
-                         self._safe_run_create(session, """
-                            OPTIONAL MATCH (caller:File {path: $caller_file_path})
-                            OPTIONAL MATCH (called:Function {name: $called_name})
-                            WITH caller, called
-                            WHERE caller IS NOT NULL AND called IS NOT NULL
-                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                        """, call_params)
+                        OPTIONAL MATCH (called:Function {name: $called_name})
+                        WITH caller, called
+                        WHERE caller IS NOT NULL AND called IS NOT NULL
+                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    """, call_params)
 
     def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict, job_id: str = None):
         """Create CALLS relationships for all functions after all files have been processed."""
@@ -1391,22 +1436,86 @@ class GraphBuilder:
             if job_id:
                 self.job_manager.update_job(job_id, total_files=len(files))
             
-            # --- Single-pass parsing: parse all files first, then build imports_map, then write ---
+            # --- #5: Incremental indexing — detect changed files ---
+            use_cache = (get_config_value("PARSE_CACHE_ENABLED") or "false").lower() == "true"
+            repo_key = str(path.resolve())
+            index_meta = self._load_index_meta() if use_cache else {}
+            repo_meta = index_meta.get(repo_key, {})
+
+            # Check if this repo already has data in DB; if not (e.g. --force wiped it),
+            # ignore stale meta and do full index
+            repo_exists_in_db = False
+            if use_cache and repo_meta:
+                try:
+                    with self.driver.session() as session:
+                        r = session.run("MATCH (f:File) WHERE f.path STARTS WITH $p RETURN count(f) AS c",
+                                        p=repo_key).single()
+                        repo_exists_in_db = r is not None and r['c'] > 0
+                except Exception:
+                    pass
+                if not repo_exists_in_db:
+                    info_logger("DB has no data for this repo — ignoring stale cache meta, doing full index")
+                    repo_meta = {}
+
+            changed_files = []
+            unchanged_files = []
+            for f in files:
+                if not f.is_file():
+                    continue
+                fp = self._file_fingerprint(f)
+                cached_fp = repo_meta.get(str(f.resolve()))
+                if use_cache and repo_exists_in_db and cached_fp == fp:
+                    unchanged_files.append(f)
+                else:
+                    changed_files.append(f)
+
+            if use_cache and unchanged_files:
+                info_logger(f"Incremental: {len(unchanged_files)} unchanged, {len(changed_files)} to process")
+                files_to_process = changed_files
+            else:
+                files_to_process = files
+
+            # --- #6: Use CREATE instead of MERGE for first-time index ---
+            first_index = self._is_db_empty()
+            if first_index:
+                info_logger("First-time index detected — using CREATE for faster writes")
+
+            # --- Single-pass parsing with #8 parse cache ---
             debug_log("Starting single-pass parsing...")
             all_file_data = []
             minimal_file_nodes = []
             processed_count = 0
+            new_meta = dict(repo_meta)  # copy existing fingerprints
 
-            for file in files:
+            for file in files_to_process:
                 if file.is_file():
                     if job_id:
                         self.job_manager.update_job(job_id, current_file=str(file))
                     repo_path = path.resolve() if path.is_dir() else file.parent.resolve()
-                    file_data = self.parse_file(repo_path, file, is_dependency)
+
+                    # #8: Try parse cache first
+                    file_data = None
+                    if use_cache:
+                        file_data = self._load_cached_parse(file)
+                        if file_data:
+                            debug_log(f"Cache hit: {file}")
+
+                    if file_data is None:
+                        file_data = self.parse_file(repo_path, file, is_dependency)
+                        if use_cache and "error" not in file_data:
+                            self._save_parse_cache(file, file_data)
+
                     if "error" not in file_data:
                         all_file_data.append(file_data)
                     else:
                         minimal_file_nodes.append((file, repo_path))
+
+                    # Update fingerprint
+                    try:
+                        new_meta[str(file.resolve())] = self._file_fingerprint(file)
+                    except OSError:
+                        pass
+
                     processed_count += 1
                     if job_id:
                         self.job_manager.update_job(job_id, processed_files=processed_count)
@@ -1443,14 +1552,25 @@ class GraphBuilder:
 
             # Write all parsed files to graph
             for file_data in all_file_data:
-                self.add_file_to_graph(file_data, repo_name, imports_map)
+                self.add_file_to_graph(file_data, repo_name, imports_map, use_create=first_index)
 
             # Write minimal nodes for unsupported files
             for file, repo_p in minimal_file_nodes:
                 self.add_minimal_file_node(file, repo_p, is_dependency)
 
             self._create_all_inheritance_links(all_file_data, imports_map, job_id=job_id)
-            self._create_all_function_calls(all_file_data, imports_map, job_id=job_id)
+
+            # --- #7: Skip function calls if configured ---
+            skip_calls = (get_config_value("SKIP_FUNCTION_CALLS") or "false").lower() == "true"
+            if skip_calls:
+                info_logger("SKIP_FUNCTION_CALLS=true — skipping function call relationship creation")
+            else:
+                self._create_all_function_calls(all_file_data, imports_map, job_id=job_id)
+
+            # --- #5: Save index metadata ---
+            if use_cache:
+                index_meta[repo_key] = new_meta
+                self._save_index_meta(index_meta)
             
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.COMPLETED, end_time=datetime.now())
