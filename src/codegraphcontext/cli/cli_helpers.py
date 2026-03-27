@@ -105,16 +105,21 @@ async def _run_index_with_progress(graph_builder: GraphBuilder, path_obj: Path, 
         )
 
         from ..core.jobs import JobStatus
+        last_stage = "indexing"
         
         # Poll for updates
         while not indexing_task.done():
             job = graph_builder.job_manager.get_job(job_id)
             if job:
+                # Reset progress bar when stage changes (Rich won't re-animate after 100%)
+                stage = getattr(job, 'stage', None) or "indexing"
+                if stage != last_stage:
+                    last_stage = stage
+                    progress.reset(task_id, total=job.total_files, completed=0)
+
                 if job.total_files > 0:
                     progress.update(task_id, total=job.total_files, completed=job.processed_files)
                 
-                # Update stage description
-                stage = getattr(job, 'stage', None) or "indexing"
                 stage_labels = {
                     "indexing": "Indexing...",
                     "inheritance": "Resolving inheritance...",
