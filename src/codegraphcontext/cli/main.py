@@ -36,6 +36,7 @@ from .cli_helpers import (
     cypher_helper_visual,
     visualize_helper,
     reindex_helper,
+    incremental_reindex_helper,
     clean_helper,
     stats_helper,
     _initialize_services,
@@ -936,6 +937,22 @@ def index(
         reindex_helper(path)
     else:
         index_helper(path)
+
+@app.command()
+def reindex(
+    path: Optional[str] = typer.Argument(None, help="Path to the repository to reindex. Defaults to the current directory."),
+):
+    """
+    Incrementally update the index for a repository.
+
+    Detects added, changed, and deleted files since last index,
+    and updates only what changed. If the repository has not been
+    indexed yet, runs a full index automatically.
+    """
+    _load_credentials()
+    if path is None:
+        path = str(Path.cwd())
+    incremental_reindex_helper(path)
 
 @app.command()
 def clean():

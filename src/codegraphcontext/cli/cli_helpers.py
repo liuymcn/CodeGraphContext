@@ -105,29 +105,15 @@ async def _run_index_with_progress(graph_builder: GraphBuilder, path_obj: Path, 
         )
 
         from ..core.jobs import JobStatus
-        last_stage = "indexing"
         
         # Poll for updates
         while not indexing_task.done():
             job = graph_builder.job_manager.get_job(job_id)
             if job:
-                # Reset progress bar when stage changes (Rich won't re-animate after 100%)
-                stage = getattr(job, 'stage', None) or "indexing"
-                if stage != last_stage:
-                    last_stage = stage
-                    progress.reset(task_id, total=job.total_files, completed=0)
-
                 if job.total_files > 0:
                     progress.update(task_id, total=job.total_files, completed=job.processed_files)
                 
-                stage_labels = {
-                    "indexing": "Indexing...",
-                    "inheritance": "Resolving inheritance...",
-                    "function_calls": "Resolving function calls..."
-                }
-                progress.update(task_id, description=stage_labels.get(stage, stage))
-
-                # Update current filename
+                # Update the current filename in the UI
                 current_file = job.current_file or ""
                 if len(current_file) > 40:
                     current_file = "..." + current_file[-37:]
@@ -180,7 +166,7 @@ def index_helper(path: str):
                 
                 if file_count > 0:
                     console.print(f"[yellow]Repository '{path}' is already indexed with {file_count} files. Skipping.[/yellow]")
-                    console.print("[dim]💡 Tip: Use 'cgc index --force' to re-index[/dim]")
+                    console.print("[dim]💡 Tip: Use 'cgc reindex' to update changed files, or 'cgc index --force' to rebuild from scratch[/dim]")
                     db_manager.close_driver()
                     return
                 else:
@@ -641,6 +627,129 @@ def _visualize_kuzudb(db_manager):
 
     except Exception as e:
         console.print(f"[bold red]Visualization failed:[/bold red] {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        db_manager.close_driver()
+
+
+def incremental_reindex_helper(path: str):
+    """Incrementally update index: add new files, update changed files, remove deleted files."""
+    time_start = time.time()
+    services = _initialize_services()
+    if not all(services):
+        return
+
+    db_manager, graph_builder, code_finder = services
+    path_obj = Path(path).resolve()
+
+    if not path_obj.exists():
+        console.print(f"[red]Error: Path does not exist: {path_obj}[/red]")
+        db_manager.close_driver()
+        return
+
+    # If not indexed yet, do a full index
+    indexed_repos = code_finder.list_indexed_repositories()
+    repo_exists = any(Path(repo["path"]).resolve() == path_obj for repo in indexed_repos)
+
+    if not repo_exists:
+        console.print(f"[yellow]Repository not yet indexed. Running full index...[/yellow]")
+        db_manager.close_driver()
+        index_helper(path)
+        return
+
+    repo_path_str = str(path_obj)
+
+    try:
+        # Get files currently in DB
+        with db_manager.get_driver().session() as session:
+            result = session.run(
+                "MATCH (f:File) WHERE f.path STARTS WITH $p RETURN f.path AS path",
+                p=repo_path_str
+            )
+            db_files = {record["path"] for record in result.data()}
+
+        # Get files on disk using shared filter logic
+        disk_file_paths = {str(f.resolve()) for f in graph_builder.collect_filtered_files(path_obj)}
+
+        # Diff
+        added = disk_file_paths - db_files
+        removed = db_files - disk_file_paths
+
+        # Check changed files (mtime-based)
+        possibly_changed = disk_file_paths & db_files
+        changed = set()
+        index_meta = graph_builder._load_index_meta()
+        repo_meta = index_meta.get(repo_path_str, {})
+        for fp in possibly_changed:
+            try:
+                current_fp = graph_builder._file_fingerprint(Path(fp))
+                if repo_meta.get(fp) != current_fp:
+                    changed.add(fp)
+            except OSError:
+                changed.add(fp)
+
+        total_changes = len(added) + len(changed) + len(removed)
+        if total_changes == 0:
+            console.print("[green]✓ Index is up to date. No changes detected.[/green]")
+            db_manager.close_driver()
+            return
+
+        console.print(f"[cyan]Incremental reindex: {len(added)} added, {len(changed)} changed, {len(removed)} removed[/cyan]")
+
+        # Remove deleted files
+        for fp in removed:
+            graph_builder.delete_file_from_graph(fp)
+
+        # Parse affected files and rebuild imports_map
+        affected_file_data = []
+        for fp in changed:
+            graph_builder.delete_file_from_graph(fp)
+            if Path(fp).exists():
+                file_data = graph_builder.parse_file(path_obj, Path(fp))
+                if "error" not in file_data:
+                    graph_builder.add_file_to_graph(file_data, path_obj.name, {})
+                    affected_file_data.append(file_data)
+
+        for fp in added:
+            file_data = graph_builder.parse_file(path_obj, Path(fp))
+            if "error" not in file_data:
+                graph_builder.add_file_to_graph(file_data, path_obj.name, {})
+                affected_file_data.append(file_data)
+
+        # Rebuild CALLS and INHERITS for affected files
+        if affected_file_data:
+            # Build imports_map from DB (all Function/Class nodes) — no re-parsing needed
+            imports_map = {}
+            with db_manager.get_driver().session() as session:
+                for label in ['Function', 'Class']:
+                    result = session.run(
+                        f"MATCH (n:{label}) WHERE n.path STARTS WITH $p RETURN n.name AS name, n.path AS path",
+                        p=repo_path_str
+                    )
+                    for record in result.data():
+                        imports_map.setdefault(record['name'], []).append(record['path'])
+
+            graph_builder._create_all_inheritance_links(affected_file_data, imports_map)
+            graph_builder._create_all_function_calls(affected_file_data, imports_map)
+
+        # Update index meta
+        new_meta = dict(repo_meta)
+        for fp in disk_file_paths:
+            try:
+                new_meta[fp] = graph_builder._file_fingerprint(Path(fp))
+            except OSError:
+                pass
+        for fp in removed:
+            new_meta.pop(fp, None)
+        index_meta[repo_path_str] = new_meta
+        graph_builder._save_index_meta(index_meta)
+
+        time_end = time.time()
+        elapsed = time_end - time_start
+        console.print(f"[green]Successfully reindexed: {path} in {elapsed:.2f} seconds ({total_changes} changes)[/green]")
+    except Exception as e:
+        console.print(f"[bold red]Error during reindex:[/bold red] {e}")
         import traceback
         traceback.print_exc()
     finally:
