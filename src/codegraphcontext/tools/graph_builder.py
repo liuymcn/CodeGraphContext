@@ -389,6 +389,274 @@ class GraphBuilder:
             )
 
     # First pass to add file and its contents
+    def _bulk_write_to_graph(self, all_file_data: list[Dict], repo_path_str: str, write_cmd: str = "MERGE"):
+        """Collect all nodes/relationships across files, write each type in one UNWIND batch."""
+        debug_log(f"Bulk writing {len(all_file_data)} files to graph...")
+
+        # --- Phase 1: Collect all data by type ---
+        all_files = []          # {path, name, relative_path, is_dependency}
+        all_dirs = []           # {path, name, parent_path, parent_label}
+        all_file_parents = []   # {parent_path, parent_label, file_path}
+        all_items = {}          # label -> [{...item, _file_path}]
+        all_params = []         # {func_name, line_number, arg_name, file_path}
+        all_modules = []        # {name, lang}
+        all_nested_funcs = []   # {context, name, line_number, file_path}
+        all_imports_js = []     # {file_path, module_name, props}
+        all_imports_other = []  # {file_path, module_name, full_import_name, rel_props}
+        all_class_funcs = []    # {class_name, func_name, func_line, file_path}
+        all_module_inclusions = []  # {class_name, module_name, file_path}
+
+        seen_dirs = set()
+
+        for label in ['Function', 'Class', 'Trait', 'Variable', 'Interface', 'Macro', 'Struct', 'Enum', 'Union', 'Record', 'Property']:
+            all_items[label] = []
+
+        for fd in all_file_data:
+            file_path_str = str(Path(fd['path']).resolve())
+            file_name = Path(file_path_str).name
+            is_dependency = fd.get('is_dependency', False)
+
+            # Compute relative path
+            try:
+                relative_path = str(Path(file_path_str).relative_to(repo_path_str))
+            except ValueError:
+                relative_path = file_name
+
+            all_files.append({
+                'path': file_path_str,
+                'name': file_name,
+                'relative_path': relative_path,
+                'is_dependency': is_dependency
+            })
+
+            # Directory chain
+            try:
+                rel_parts = Path(file_path_str).relative_to(repo_path_str)
+            except ValueError:
+                rel_parts = Path(file_name)
+
+            parent_path = repo_path_str
+            parent_label = 'Repository'
+            for part in rel_parts.parts[:-1]:
+                current_path = str(Path(parent_path) / part)
+                dir_key = (parent_path, current_path)
+                if dir_key not in seen_dirs:
+                    seen_dirs.add(dir_key)
+                    all_dirs.append({
+                        'parent_path': parent_path,
+                        'parent_label': parent_label,
+                        'current_path': current_path,
+                        'part': part
+                    })
+                parent_path = current_path
+                parent_label = 'Directory'
+
+            all_file_parents.append({
+                'parent_path': parent_path,
+                'parent_label': parent_label,
+                'file_path': file_path_str
+            })
+
+            # Item nodes (functions, classes, etc.)
+            item_keys = [
+                ('functions', 'Function'), ('classes', 'Class'), ('traits', 'Trait'),
+                ('variables', 'Variable'), ('interfaces', 'Interface'), ('macros', 'Macro'),
+                ('structs', 'Struct'), ('enums', 'Enum'), ('unions', 'Union'),
+                ('records', 'Record'), ('properties', 'Property'),
+            ]
+            for data_key, label in item_keys:
+                for item in fd.get(data_key, []):
+                    if label == 'Function' and 'cyclomatic_complexity' not in item:
+                        item['cyclomatic_complexity'] = 1
+                    item_copy = dict(item)
+                    item_copy['_file_path'] = file_path_str
+                    all_items[label].append(item_copy)
+
+                    if label == 'Function':
+                        for arg_name in item.get('args', []):
+                            all_params.append({
+                                'func_name': item['name'],
+                                'line_number': item['line_number'],
+                                'arg_name': arg_name,
+                                'file_path': file_path_str
+                            })
+
+            # Modules (Ruby)
+            for m in fd.get('modules', []):
+                all_modules.append({'name': m['name'], 'lang': fd.get('lang')})
+
+            # Nested functions
+            for item in fd.get('functions', []):
+                if item.get('context_type') == 'function_definition':
+                    all_nested_funcs.append({
+                        'context': item['context'],
+                        'name': item['name'],
+                        'line_number': item['line_number'],
+                        'file_path': file_path_str
+                    })
+
+            # Imports
+            lang = fd.get('lang')
+            for imp in fd.get('imports', []):
+                if lang == 'javascript':
+                    module_name = imp.get('source')
+                    if not module_name:
+                        continue
+                    rel_props = {'imported_name': imp.get('name', '*')}
+                    if imp.get('alias'):
+                        rel_props['alias'] = imp['alias']
+                    if imp.get('line_number'):
+                        rel_props['line_number'] = imp['line_number']
+                    all_imports_js.append({
+                        'file_path': file_path_str,
+                        'module_name': module_name,
+                        'props': rel_props
+                    })
+                else:
+                    rel_props = {}
+                    if imp.get('line_number'):
+                        rel_props['line_number'] = imp['line_number']
+                    if imp.get('alias'):
+                        rel_props['alias'] = imp['alias']
+                    all_imports_other.append({
+                        'file_path': file_path_str,
+                        'module_name': imp.get('name'),
+                        'full_import_name': imp.get('full_import_name'),
+                        'rel_props': rel_props
+                    })
+
+            # Class→Function CONTAINS
+            for func in fd.get('functions', []):
+                if func.get('class_context'):
+                    all_class_funcs.append({
+                        'class_name': func['class_context'],
+                        'func_name': func['name'],
+                        'func_line': func['line_number'],
+                        'file_path': file_path_str
+                    })
+
+            # Module inclusions (Ruby)
+            for inc in fd.get('module_inclusions', []):
+                all_module_inclusions.append({
+                    'class_name': inc['class'],
+                    'module_name': inc['module'],
+                    'file_path': file_path_str
+                })
+
+        # --- Phase 2: Batch write to DB ---
+        with self.driver.session() as session:
+            # 1. File nodes
+            if all_files:
+                session.run(f"""
+                    UNWIND $items AS item
+                    {write_cmd} (f:File {{path: item.path}})
+                    SET f.name = item.name, f.relative_path = item.relative_path, f.is_dependency = item.is_dependency
+                """, items=all_files)
+                debug_log(f"Wrote {len(all_files)} File nodes")
+
+            # 2. Directory nodes + CONTAINS (must be sequential for parent chain)
+            for d in all_dirs:
+                session.run(f"""
+                    MATCH (p:{d['parent_label']} {{path: $parent_path}})
+                    {write_cmd} (dir:Directory {{path: $current_path}})
+                    SET dir.name = $part
+                    {write_cmd} (p)-[:CONTAINS]->(dir)
+                """, parent_path=d['parent_path'], current_path=d['current_path'], part=d['part'])
+
+            # 3. File→parent CONTAINS (batch by parent_label)
+            for label in ['Repository', 'Directory']:
+                batch = [fp for fp in all_file_parents if fp['parent_label'] == label]
+                if batch:
+                    session.run(f"""
+                        UNWIND $items AS item
+                        MATCH (p:{label} {{path: item.parent_path}})
+                        MATCH (f:File {{path: item.file_path}})
+                        {write_cmd} (p)-[:CONTAINS]->(f)
+                    """, items=[{'parent_path': b['parent_path'], 'file_path': b['file_path']} for b in batch])
+
+            # 4. Item nodes (Function, Class, etc.)
+            for label, items in all_items.items():
+                if not items:
+                    continue
+                session.run(f"""
+                    UNWIND $items AS item
+                    MATCH (f:File {{path: item._file_path}})
+                    {write_cmd} (n:{label} {{name: item.name, path: item._file_path, line_number: item.line_number}})
+                    SET n += item
+                    {write_cmd} (f)-[:CONTAINS]->(n)
+                """, items=items)
+                debug_log(f"Wrote {len(items)} {label} nodes")
+
+            # 5. Parameters
+            if all_params:
+                session.run(f"""
+                    UNWIND $items AS p
+                    MATCH (fn:Function {{name: p.func_name, path: p.file_path, line_number: p.line_number}})
+                    {write_cmd} (param:Parameter {{name: p.arg_name, path: p.file_path, function_line_number: p.line_number}})
+                    {write_cmd} (fn)-[:HAS_PARAMETER]->(param)
+                """, items=all_params)
+
+            # 6. Modules (Ruby)
+            if all_modules:
+                session.run("""
+                    UNWIND $items AS item
+                    MERGE (mod:Module {name: item.name})
+                    ON CREATE SET mod.lang = item.lang
+                    ON MATCH SET mod.lang = coalesce(mod.lang, item.lang)
+                """, items=all_modules)
+
+            # 7. Nested function CONTAINS
+            if all_nested_funcs:
+                session.run("""
+                    UNWIND $items AS item
+                    MATCH (outer:Function {name: item.context, path: item.file_path})
+                    MATCH (inner:Function {name: item.name, path: item.file_path, line_number: item.line_number})
+                    MERGE (outer)-[:CONTAINS]->(inner)
+                """, items=all_nested_funcs)
+
+            # 8. Imports (JS)
+            if all_imports_js:
+                for imp in all_imports_js:
+                    session.run("""
+                        MATCH (f:File {path: $file_path})
+                        MERGE (m:Module {name: $module_name})
+                        MERGE (f)-[r:IMPORTS]->(m)
+                        SET r += $props
+                    """, file_path=imp['file_path'], module_name=imp['module_name'], props=imp['props'])
+
+            # 9. Imports (other languages)
+            if all_imports_other:
+                for imp in all_imports_other:
+                    set_clause = "SET m.full_import_name = $full_import_name" if imp.get('full_import_name') else ""
+                    session.run(f"""
+                        MATCH (f:File {{path: $file_path}})
+                        MERGE (m:Module {{name: $module_name}})
+                        {set_clause}
+                        MERGE (f)-[r:IMPORTS]->(m)
+                        SET r += $rel_props
+                    """, file_path=imp['file_path'], module_name=imp['module_name'],
+                         full_import_name=imp.get('full_import_name'), rel_props=imp['rel_props'])
+
+            # 10. Class→Function CONTAINS
+            if all_class_funcs:
+                session.run("""
+                    UNWIND $items AS item
+                    MATCH (c:Class {name: item.class_name, path: item.file_path})
+                    MATCH (fn:Function {name: item.func_name, path: item.file_path, line_number: item.func_line})
+                    MERGE (c)-[:CONTAINS]->(fn)
+                """, items=all_class_funcs)
+
+            # 11. Module inclusions (Ruby)
+            if all_module_inclusions:
+                session.run("""
+                    UNWIND $items AS item
+                    MATCH (c:Class {name: item.class_name, path: item.file_path})
+                    MERGE (m:Module {name: item.module_name})
+                    MERGE (c)-[:INCLUDES]->(m)
+                """, items=all_module_inclusions)
+
+        debug_log(f"Bulk write complete for {len(all_file_data)} files")
+
     def add_file_to_graph(self, file_data: Dict, repo_name: str, imports_map: dict, use_create: bool = False):
         """Adds a file and its contents within a single, unified session."""
         calls_count = len(file_data.get('function_calls', []))
@@ -1552,9 +1820,8 @@ class GraphBuilder:
 
             debug_log(f"Imports map built with {len(imports_map)} definitions. Writing to graph...")
 
-            # Write all parsed files to graph
-            for file_data in all_file_data:
-                self.add_file_to_graph(file_data, repo_name, imports_map, use_create=first_index)
+            # --- Bulk graph write: collect all data, then write by type ---
+            self._bulk_write_to_graph(all_file_data, str(path.resolve()), write_cmd="CREATE" if first_index else "MERGE")
 
             # Write minimal nodes for unsupported files
             for file, repo_p in minimal_file_nodes:
