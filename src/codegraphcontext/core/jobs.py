@@ -39,6 +39,7 @@ class JobInfo:
     result: Optional[Dict[str, Any]] = None
     path: Optional[str] = None
     is_dependency: bool = False
+    stage: Optional[str] = None
 
     def __post_init__(self):
         """Ensures the errors list is initialized after the object is created."""

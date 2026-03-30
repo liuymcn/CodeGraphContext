@@ -44,6 +44,8 @@ DEFAULT_CONFIG = {
     "SCIP_INDEXER": "false",
     "SCIP_LANGUAGES": "python,typescript,go,rust,java",
     "SKIP_EXTERNAL_RESOLUTION": "false",
+    "SKIP_FUNCTION_CALLS": "false",
+    "PARSE_CACHE_ENABLED": "false",
 }
 
 # Configuration key descriptions
@@ -71,6 +73,8 @@ CONFIG_DESCRIPTIONS = {
     "SCIP_INDEXER": "Use SCIP-based indexing for higher accuracy call/inheritance resolution (requires scip-<lang> tools installed)",
     "SCIP_LANGUAGES": "Comma-separated languages to index via SCIP when SCIP_INDEXER=true (python,typescript,go,rust,java)",
     "SKIP_EXTERNAL_RESOLUTION": "Skip resolution attempts for external library method calls (recommended for enterprise large Java/Spring codebases)",
+    "SKIP_FUNCTION_CALLS": "Skip function call relationship creation entirely (faster indexing when call graph is not needed)",
+    "PARSE_CACHE_ENABLED": "Cache parse results to ~/.codegraphcontext/cgc_cache/ for faster re-indexing",
 }
 
 # Valid values for each config key
@@ -88,6 +92,8 @@ CONFIG_VALIDATORS = {
     "INDEX_SOURCE": ["true", "false"],
     "SCIP_INDEXER": ["true", "false"],
     "SKIP_EXTERNAL_RESOLUTION": ["true", "false"],
+    "SKIP_FUNCTION_CALLS": ["true", "false"],
+    "PARSE_CACHE_ENABLED": ["true", "false"],
 }
 def ensure_config_dir(path: Path = CONFIG_DIR):
     """
@@ -151,13 +157,20 @@ def load_config() -> Dict[str, str]:
 
 def find_local_env() -> Optional[Path]:
     """
-    Find a local .env file by searching current directory and parents.
-    Returns the first .env file found, or None.
+    Find a local project config file by searching current directory and parents.
+    Priority: .codegraphcontext/config.env > .env (legacy)
+    Returns the first config file found, or None.
     """
     current = Path.cwd()
     
     # Search up to 5 levels up
     for _ in range(5):
+        # Prefer .codegraphcontext/config.env
+        cgc_config = current / ".codegraphcontext" / "config.env"
+        if cgc_config.exists():
+            return cgc_config
+        
+        # Fallback to .env (legacy/backward compat)
         env_file = current / ".env"
         if env_file.exists() and env_file != CONFIG_FILE:
             return env_file

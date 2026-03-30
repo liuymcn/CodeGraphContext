@@ -1,6 +1,9 @@
 
 # src/codegraphcontext/tools/graph_builder.py
 import asyncio
+import hashlib
+import json as json_mod
+import os
 import pathspec
 from pathlib import Path
 from typing import Any, Coroutine, Dict, Optional, Tuple
@@ -13,7 +16,7 @@ from ..utils.debug_log import debug_log, info_logger, error_logger, warning_logg
 # New imports for tree-sitter (using tree-sitter-language-pack)
 from tree_sitter import Language, Parser
 from ..utils.tree_sitter_manager import get_tree_sitter_manager
-from ..cli.config_manager import get_config_value
+from ..cli.config_manager import get_config_value, CONFIG_DIR
 import fnmatch
  
 DEFAULT_IGNORE_PATTERNS = [
@@ -194,6 +197,83 @@ class GraphBuilder:
             except Exception as e:
                 warning_logger(f"Schema creation warning: {e}")
 
+    # --- #6: First-index CREATE optimization ---
+    def _is_db_empty(self) -> bool:
+        """Check if the database has no Repository nodes (first-time index)."""
+        try:
+            with self.driver.session() as session:
+                result = session.run("MATCH (r:Repository) RETURN count(r) AS c")
+                row = result.single()
+                return row is not None and row['c'] == 0
+        except Exception:
+            return False
+
+    # --- #8: Parse cache helpers ---
+    @staticmethod
+    def _get_cache_dir() -> Path:
+        d = CONFIG_DIR / "cgc_cache"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    @staticmethod
+    def _cache_key(file_path: Path) -> str:
+        return hashlib.md5(str(file_path.resolve()).encode()).hexdigest()
+
+    @staticmethod
+    def _file_fingerprint(file_path: Path) -> str:
+        """mtime + size fingerprint for change detection."""
+        st = file_path.stat()
+        return f"{st.st_mtime_ns}:{st.st_size}"
+
+    def _load_cached_parse(self, file_path: Path) -> Optional[Dict]:
+        """Load cached parse result if file hasn't changed."""
+        cache_dir = self._get_cache_dir()
+        key = self._cache_key(file_path)
+        cache_file = cache_dir / f"{key}.json"
+        if not cache_file.exists():
+            return None
+        try:
+            data = json_mod.loads(cache_file.read_text(encoding='utf-8'))
+            if data.get('_fingerprint') == self._file_fingerprint(file_path):
+                data.pop('_fingerprint', None)
+                return data
+        except Exception:
+            pass
+        return None
+
+    def _save_parse_cache(self, file_path: Path, file_data: Dict):
+        """Save parse result to cache."""
+        cache_dir = self._get_cache_dir()
+        key = self._cache_key(file_path)
+        cache_file = cache_dir / f"{key}.json"
+        try:
+            to_save = file_data.copy()
+            to_save['_fingerprint'] = self._file_fingerprint(file_path)
+            cache_file.write_text(json_mod.dumps(to_save, default=str, ensure_ascii=False), encoding='utf-8')
+        except Exception as e:
+            debug_log(f"Failed to save parse cache for {file_path}: {e}")
+
+    # --- #5: Incremental indexing helpers ---
+    @staticmethod
+    def _get_index_meta_path() -> Path:
+        return CONFIG_DIR / "cgc_cache" / "_index_meta.json"
+
+    def _load_index_meta(self) -> Dict:
+        p = self._get_index_meta_path()
+        if p.exists():
+            try:
+                return json_mod.loads(p.read_text(encoding='utf-8'))
+            except Exception:
+                pass
+        return {}
+
+    def _save_index_meta(self, meta: Dict):
+        p = self._get_index_meta_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            p.write_text(json_mod.dumps(meta, default=str, ensure_ascii=False), encoding='utf-8')
+        except Exception as e:
+            debug_log(f"Failed to save index meta: {e}")
 
     def _pre_scan_for_imports(self, files: list[Path]) -> dict:
         """Dispatches pre-scan to the correct language-specific implementation."""
@@ -309,13 +389,283 @@ class GraphBuilder:
             )
 
     # First pass to add file and its contents
-    def add_file_to_graph(self, file_data: Dict, repo_name: str, imports_map: dict):
+    def _bulk_write_to_graph(self, all_file_data: list[Dict], repo_path_str: str, write_cmd: str = "MERGE"):
+        """Collect all nodes/relationships across files, write each type in one UNWIND batch."""
+        debug_log(f"Bulk writing {len(all_file_data)} files to graph...")
+
+        # --- Phase 1: Collect all data by type ---
+        all_files = []          # {path, name, relative_path, is_dependency}
+        all_dirs = []           # {path, name, parent_path, parent_label}
+        all_file_parents = []   # {parent_path, parent_label, file_path}
+        all_items = {}          # label -> [{...item, _file_path}]
+        all_params = []         # {func_name, line_number, arg_name, file_path}
+        all_modules = []        # {name, lang}
+        all_nested_funcs = []   # {context, name, line_number, file_path}
+        all_imports_js = []     # {file_path, module_name, props}
+        all_imports_other = []  # {file_path, module_name, full_import_name, rel_props}
+        all_class_funcs = []    # {class_name, func_name, func_line, file_path}
+        all_module_inclusions = []  # {class_name, module_name, file_path}
+
+        seen_dirs = set()
+
+        for label in ['Function', 'Class', 'Trait', 'Variable', 'Interface', 'Macro', 'Struct', 'Enum', 'Union', 'Record', 'Property']:
+            all_items[label] = []
+
+        for fd in all_file_data:
+            file_path_str = str(Path(fd['path']).resolve())
+            file_name = Path(file_path_str).name
+            is_dependency = fd.get('is_dependency', False)
+
+            # Compute relative path
+            try:
+                relative_path = str(Path(file_path_str).relative_to(repo_path_str))
+            except ValueError:
+                relative_path = file_name
+
+            all_files.append({
+                'path': file_path_str,
+                'name': file_name,
+                'relative_path': relative_path,
+                'is_dependency': is_dependency
+            })
+
+            # Directory chain
+            try:
+                rel_parts = Path(file_path_str).relative_to(repo_path_str)
+            except ValueError:
+                rel_parts = Path(file_name)
+
+            parent_path = repo_path_str
+            parent_label = 'Repository'
+            for part in rel_parts.parts[:-1]:
+                current_path = str(Path(parent_path) / part)
+                dir_key = (parent_path, current_path)
+                if dir_key not in seen_dirs:
+                    seen_dirs.add(dir_key)
+                    all_dirs.append({
+                        'parent_path': parent_path,
+                        'parent_label': parent_label,
+                        'current_path': current_path,
+                        'part': part
+                    })
+                parent_path = current_path
+                parent_label = 'Directory'
+
+            all_file_parents.append({
+                'parent_path': parent_path,
+                'parent_label': parent_label,
+                'file_path': file_path_str
+            })
+
+            # Item nodes (functions, classes, etc.)
+            item_keys = [
+                ('functions', 'Function'), ('classes', 'Class'), ('traits', 'Trait'),
+                ('variables', 'Variable'), ('interfaces', 'Interface'), ('macros', 'Macro'),
+                ('structs', 'Struct'), ('enums', 'Enum'), ('unions', 'Union'),
+                ('records', 'Record'), ('properties', 'Property'),
+            ]
+            for data_key, label in item_keys:
+                for item in fd.get(data_key, []):
+                    if label == 'Function' and 'cyclomatic_complexity' not in item:
+                        item['cyclomatic_complexity'] = 1
+                    item_copy = dict(item)
+                    item_copy['_file_path'] = file_path_str
+                    all_items[label].append(item_copy)
+
+                    if label == 'Function':
+                        for arg_name in item.get('args', []):
+                            all_params.append({
+                                'func_name': item['name'],
+                                'line_number': item['line_number'],
+                                'arg_name': arg_name,
+                                'file_path': file_path_str
+                            })
+
+            # Modules (Ruby)
+            for m in fd.get('modules', []):
+                all_modules.append({'name': m['name'], 'lang': fd.get('lang')})
+
+            # Nested functions
+            for item in fd.get('functions', []):
+                if item.get('context_type') == 'function_definition':
+                    all_nested_funcs.append({
+                        'context': item['context'],
+                        'name': item['name'],
+                        'line_number': item['line_number'],
+                        'file_path': file_path_str
+                    })
+
+            # Imports
+            lang = fd.get('lang')
+            for imp in fd.get('imports', []):
+                if lang == 'javascript':
+                    module_name = imp.get('source')
+                    if not module_name:
+                        continue
+                    rel_props = {'imported_name': imp.get('name', '*')}
+                    if imp.get('alias'):
+                        rel_props['alias'] = imp['alias']
+                    if imp.get('line_number'):
+                        rel_props['line_number'] = imp['line_number']
+                    all_imports_js.append({
+                        'file_path': file_path_str,
+                        'module_name': module_name,
+                        'props': rel_props
+                    })
+                else:
+                    rel_props = {}
+                    if imp.get('line_number'):
+                        rel_props['line_number'] = imp['line_number']
+                    if imp.get('alias'):
+                        rel_props['alias'] = imp['alias']
+                    all_imports_other.append({
+                        'file_path': file_path_str,
+                        'module_name': imp.get('name'),
+                        'full_import_name': imp.get('full_import_name'),
+                        'rel_props': rel_props
+                    })
+
+            # Class→Function CONTAINS
+            for func in fd.get('functions', []):
+                if func.get('class_context'):
+                    all_class_funcs.append({
+                        'class_name': func['class_context'],
+                        'func_name': func['name'],
+                        'func_line': func['line_number'],
+                        'file_path': file_path_str
+                    })
+
+            # Module inclusions (Ruby)
+            for inc in fd.get('module_inclusions', []):
+                all_module_inclusions.append({
+                    'class_name': inc['class'],
+                    'module_name': inc['module'],
+                    'file_path': file_path_str
+                })
+
+        # --- Phase 2: Batch write to DB ---
+        with self.driver.session() as session:
+            # 1. File nodes
+            if all_files:
+                session.run(f"""
+                    UNWIND $items AS item
+                    {write_cmd} (f:File {{path: item.path}})
+                    SET f.name = item.name, f.relative_path = item.relative_path, f.is_dependency = item.is_dependency
+                """, items=all_files)
+                debug_log(f"Wrote {len(all_files)} File nodes")
+
+            # 2. Directory nodes + CONTAINS (must be sequential for parent chain)
+            for d in all_dirs:
+                session.run(f"""
+                    MATCH (p:{d['parent_label']} {{path: $parent_path}})
+                    {write_cmd} (dir:Directory {{path: $current_path}})
+                    SET dir.name = $part
+                    {write_cmd} (p)-[:CONTAINS]->(dir)
+                """, parent_path=d['parent_path'], current_path=d['current_path'], part=d['part'])
+
+            # 3. File→parent CONTAINS (batch by parent_label)
+            for label in ['Repository', 'Directory']:
+                batch = [fp for fp in all_file_parents if fp['parent_label'] == label]
+                if batch:
+                    session.run(f"""
+                        UNWIND $items AS item
+                        MATCH (p:{label} {{path: item.parent_path}})
+                        MATCH (f:File {{path: item.file_path}})
+                        {write_cmd} (p)-[:CONTAINS]->(f)
+                    """, items=[{'parent_path': b['parent_path'], 'file_path': b['file_path']} for b in batch])
+
+            # 4. Item nodes (Function, Class, etc.)
+            for label, items in all_items.items():
+                if not items:
+                    continue
+                session.run(f"""
+                    UNWIND $items AS item
+                    MATCH (f:File {{path: item._file_path}})
+                    {write_cmd} (n:{label} {{name: item.name, path: item._file_path, line_number: item.line_number}})
+                    SET n += item
+                    {write_cmd} (f)-[:CONTAINS]->(n)
+                """, items=items)
+                debug_log(f"Wrote {len(items)} {label} nodes")
+
+            # 5. Parameters
+            if all_params:
+                session.run(f"""
+                    UNWIND $items AS p
+                    MATCH (fn:Function {{name: p.func_name, path: p.file_path, line_number: p.line_number}})
+                    {write_cmd} (param:Parameter {{name: p.arg_name, path: p.file_path, function_line_number: p.line_number}})
+                    {write_cmd} (fn)-[:HAS_PARAMETER]->(param)
+                """, items=all_params)
+
+            # 6. Modules (Ruby)
+            if all_modules:
+                session.run("""
+                    UNWIND $items AS item
+                    MERGE (mod:Module {name: item.name})
+                    ON CREATE SET mod.lang = item.lang
+                    ON MATCH SET mod.lang = coalesce(mod.lang, item.lang)
+                """, items=all_modules)
+
+            # 7. Nested function CONTAINS
+            if all_nested_funcs:
+                session.run("""
+                    UNWIND $items AS item
+                    MATCH (outer:Function {name: item.context, path: item.file_path})
+                    MATCH (inner:Function {name: item.name, path: item.file_path, line_number: item.line_number})
+                    MERGE (outer)-[:CONTAINS]->(inner)
+                """, items=all_nested_funcs)
+
+            # 8. Imports (JS)
+            if all_imports_js:
+                for imp in all_imports_js:
+                    session.run("""
+                        MATCH (f:File {path: $file_path})
+                        MERGE (m:Module {name: $module_name})
+                        MERGE (f)-[r:IMPORTS]->(m)
+                        SET r += $props
+                    """, file_path=imp['file_path'], module_name=imp['module_name'], props=imp['props'])
+
+            # 9. Imports (other languages)
+            if all_imports_other:
+                for imp in all_imports_other:
+                    set_clause = "SET m.full_import_name = $full_import_name" if imp.get('full_import_name') else ""
+                    session.run(f"""
+                        MATCH (f:File {{path: $file_path}})
+                        MERGE (m:Module {{name: $module_name}})
+                        {set_clause}
+                        MERGE (f)-[r:IMPORTS]->(m)
+                        SET r += $rel_props
+                    """, file_path=imp['file_path'], module_name=imp['module_name'],
+                         full_import_name=imp.get('full_import_name'), rel_props=imp['rel_props'])
+
+            # 10. Class→Function CONTAINS
+            if all_class_funcs:
+                session.run("""
+                    UNWIND $items AS item
+                    MATCH (c:Class {name: item.class_name, path: item.file_path})
+                    MATCH (fn:Function {name: item.func_name, path: item.file_path, line_number: item.func_line})
+                    MERGE (c)-[:CONTAINS]->(fn)
+                """, items=all_class_funcs)
+
+            # 11. Module inclusions (Ruby)
+            if all_module_inclusions:
+                session.run("""
+                    UNWIND $items AS item
+                    MATCH (c:Class {name: item.class_name, path: item.file_path})
+                    MERGE (m:Module {name: item.module_name})
+                    MERGE (c)-[:INCLUDES]->(m)
+                """, items=all_module_inclusions)
+
+        debug_log(f"Bulk write complete for {len(all_file_data)} files")
+
+    def add_file_to_graph(self, file_data: Dict, repo_name: str, imports_map: dict, use_create: bool = False):
+        """Adds a file and its contents within a single, unified session."""
         calls_count = len(file_data.get('function_calls', []))
         debug_log(f"Executing add_file_to_graph for {file_data.get('path', 'unknown')} - Calls found: {calls_count}")
-        """Adds a file and its contents within a single, unified session."""
         file_path_str = str(Path(file_data['path']).resolve())
         file_name = Path(file_path_str).name
         is_dependency = file_data.get('is_dependency', False)
+        # #6: Use CREATE for first-time index, MERGE otherwise
+        write_cmd = "CREATE" if use_create else "MERGE"
 
         with self.driver.session() as session:
             try:
@@ -325,8 +675,8 @@ class GraphBuilder:
             except ValueError:
                 relative_path = file_name
 
-            session.run("""
-                MERGE (f:File {path: $path})
+            session.run(f"""
+                {write_cmd} (f:File {{path: $path}})
                 SET f.name = $name, f.relative_path = $relative_path, f.is_dependency = $is_dependency
             """, path=file_path_str, name=file_name, relative_path=relative_path, is_dependency=is_dependency)
 
@@ -349,9 +699,9 @@ class GraphBuilder:
                 
                 session.run(f"""
                     MATCH (p:{parent_label} {{path: $parent_path}})
-                    MERGE (d:Directory {{path: $current_path}})
+                    {write_cmd} (d:Directory {{path: $current_path}})
                     SET d.name = $part
-                    MERGE (p)-[:CONTAINS]->(d)
+                    {write_cmd} (p)-[:CONTAINS]->(d)
                 """, parent_path=parent_path, current_path=current_path_str, part=part)
 
                 parent_path = current_path_str
@@ -360,7 +710,7 @@ class GraphBuilder:
             session.run(f"""
                 MATCH (p:{parent_label} {{path: $parent_path}})
                 MATCH (f:File {{path: $path}})
-                MERGE (p)-[:CONTAINS]->(f)
+                {write_cmd} (p)-[:CONTAINS]->(f)
             """, parent_path=parent_path, path=file_path_str)
 
             # CONTAINS relationships for functions, classes, and variables
@@ -382,27 +732,40 @@ class GraphBuilder:
                 (file_data.get('properties',[]), 'Property'),
             ]
             for item_data, label in item_mappings:
-                for item in item_data:
-                    # Ensure cyclomatic_complexity is set for functions
-                    if label == 'Function' and 'cyclomatic_complexity' not in item:
-                        item['cyclomatic_complexity'] = 1 # Default value
+                if not item_data:
+                    continue
+                # Ensure cyclomatic_complexity is set for functions
+                if label == 'Function':
+                    for item in item_data:
+                        if 'cyclomatic_complexity' not in item:
+                            item['cyclomatic_complexity'] = 1
 
-                    query = f"""
-                        MATCH (f:File {{path: $path}})
-                        MERGE (n:{label} {{name: $name, path: $path, line_number: $line_number}})
-                        SET n += $props
-                        MERGE (f)-[:CONTAINS]->(n)
-                    """
+                # Batch write nodes with UNWIND
+                session.run(f"""
+                    UNWIND $items AS item
+                    MATCH (f:File {{path: $path}})
+                    {write_cmd} (n:{label} {{name: item.name, path: $path, line_number: item.line_number}})
+                    SET n += item
+                    {write_cmd} (f)-[:CONTAINS]->(n)
+                """, path=file_path_str, items=item_data)
 
-                    session.run(query, path=file_path_str, name=item['name'], line_number=item['line_number'], props=item)
-                    
-                    if label == 'Function':
+                # Batch write parameters for functions
+                if label == 'Function':
+                    params_batch = []
+                    for item in item_data:
                         for arg_name in item.get('args', []):
-                            session.run("""
-                                MATCH (fn:Function {name: $func_name, path: $path, line_number: $line_number})
-                                MERGE (p:Parameter {name: $arg_name, path: $path, function_line_number: $line_number})
-                                MERGE (fn)-[:HAS_PARAMETER]->(p)
-                            """, func_name=item['name'], path=file_path_str, line_number=item['line_number'], arg_name=arg_name)
+                            params_batch.append({
+                                'func_name': item['name'],
+                                'line_number': item['line_number'],
+                                'arg_name': arg_name
+                            })
+                    if params_batch:
+                        session.run(f"""
+                            UNWIND $params AS p
+                            MATCH (fn:Function {{name: p.func_name, path: $path, line_number: p.line_number}})
+                            {write_cmd} (param:Parameter {{name: p.arg_name, path: $path, function_line_number: p.line_number}})
+                            {write_cmd} (fn)-[:HAS_PARAMETER]->(param)
+                        """, path=file_path_str, params=params_batch)
 
             # --- NEW: persist Ruby Modules ---
             for m in file_data.get('modules', []):
@@ -638,8 +1001,6 @@ class GraphBuilder:
             if caller_context and len(caller_context) == 3 and caller_context[0] is not None:
                 caller_name, _, caller_line_number = caller_context
                 
-                # KùzuDB workaround: Try Function->Function first, then other combinations
-                # This avoids polymorphic MERGE which KùzuDB doesn't support
                 call_params = {
                     'caller_name': caller_name,
                     'caller_file_path': caller_file_path,
@@ -651,63 +1012,35 @@ class GraphBuilder:
                     'full_call_name': call.get('full_name', called_name)
                 }
                 
-                # Try Function caller -> Function callee
+                # #9: Merged COALESCE query — replaces 5-step cascade with 1 DB round-trip
+                # Priority: Function > Class for caller; Function > __init__ > Class for target
                 if not self._safe_run_create(session, """
-                    OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_file_path})
-                    OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
-                    WITH caller, called
-                    WHERE caller IS NOT NULL AND called IS NOT NULL
-                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    OPTIONAL MATCH (cf:Function {name: $caller_name, path: $caller_file_path})
+                    OPTIONAL MATCH (cc:Class {name: $caller_name, path: $caller_file_path})
+                    WITH COALESCE(cf, cc) AS caller
+                    WHERE caller IS NOT NULL
+                    OPTIONAL MATCH (tf:Function {name: $called_name, path: $called_file_path})
+                    OPTIONAL MATCH (tc:Class {name: $called_name, path: $called_file_path})
+                    OPTIONAL MATCH (tc)-[:CONTAINS]->(init:Function)
+                    WHERE init.name IN ["__init__", "constructor"]
+                    WITH caller, COALESCE(tf, init, tc) AS target
+                    WHERE target IS NOT NULL
+                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(target)
                     RETURN count(*) as created
                 """, call_params):
-                
-                    # Try Function caller -> Class callee (with __init__ resolution)
-                    if not self._safe_run_create(session, """
-                        OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_file_path})
-                        OPTIONAL MATCH (called:Class {name: $called_name, path: $called_file_path})
-                        OPTIONAL MATCH (called)-[:CONTAINS]->(init:Function)
-                        WHERE init.name IN ["__init__", "constructor"]
-                        WITH caller, COALESCE(init, called) as final_target
-                        WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
-                        RETURN count(*) as created
-                    """, call_params):
-                
-                        # Try Class caller -> Function callee
-                        if not self._safe_run_create(session, """
-                            OPTIONAL MATCH (caller:Class {name: $caller_name, path: $caller_file_path})
-                            OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
-                            WITH caller, called
-                            WHERE caller IS NOT NULL AND called IS NOT NULL
-                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                            RETURN count(*) as created
-                        """, call_params):
-                
-                            # Try Class caller -> Class callee
-                            if not self._safe_run_create(session, """
-                                OPTIONAL MATCH (caller:Class {name: $caller_name, path: $caller_file_path})
-                                OPTIONAL MATCH (called:Class {name: $called_name, path: $called_file_path})
-                                OPTIONAL MATCH (called)-[:CONTAINS]->(init:Function)
-                                WHERE init.name IN ["__init__", "constructor"]
-                                WITH caller, COALESCE(init, called) as final_target
-                                WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                                MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
-                                RETURN count(*) as created
-                            """, call_params):
-
-                                 # Fallback: Relaxed Global Search (Caller: Function/Class -> Callee: Function)
-                                 # Used when path resolution failed or was ambiguous
-                                 self._safe_run_create(session, """
-                                    OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_file_path}) 
-                                    OPTIONAL MATCH (callerClass:Class {name: $caller_name, path: $caller_file_path})
-                                    WITH COALESCE(caller, callerClass) as final_caller
-                                    OPTIONAL MATCH (called:Function {name: $called_name})
-                                    WITH final_caller, called
-                                    WHERE final_caller IS NOT NULL AND called IS NOT NULL
-                                    MERGE (final_caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                                """, call_params)
+                    # Fallback: global search without path constraint on callee
+                    self._safe_run_create(session, """
+                        OPTIONAL MATCH (cf:Function {name: $caller_name, path: $caller_file_path})
+                        OPTIONAL MATCH (cc:Class {name: $caller_name, path: $caller_file_path})
+                        WITH COALESCE(cf, cc) AS caller
+                        WHERE caller IS NOT NULL
+                        OPTIONAL MATCH (called:Function {name: $called_name})
+                        WITH caller, called
+                        WHERE called IS NOT NULL
+                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    """, call_params)
             else:
-                # File-level calls: Try Function first, then Class
+                # File-level calls
                 call_params = {
                     'caller_file_path': caller_file_path,
                     'called_name': called_name,
@@ -717,42 +1050,40 @@ class GraphBuilder:
                     'full_call_name': call.get('full_name', called_name)
                 }
                 
+                # #9: Merged COALESCE for file-level calls
                 if not self._safe_run_create(session, """
                     OPTIONAL MATCH (caller:File {path: $caller_file_path})
-                    OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
-                    WITH caller, called
-                    WHERE caller IS NOT NULL AND called IS NOT NULL
-                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    WHERE caller IS NOT NULL
+                    OPTIONAL MATCH (tf:Function {name: $called_name, path: $called_file_path})
+                    OPTIONAL MATCH (tc:Class {name: $called_name, path: $called_file_path})
+                    OPTIONAL MATCH (tc)-[:CONTAINS]->(init:Function)
+                    WHERE init.name IN ["__init__", "constructor"]
+                    WITH caller, COALESCE(tf, init, tc) AS target
+                    WHERE target IS NOT NULL
+                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(target)
                     RETURN count(*) as created
                 """, call_params):
-                
-                    if not self._safe_run_create(session, """
+                    # Fallback: global search
+                    self._safe_run_create(session, """
                         OPTIONAL MATCH (caller:File {path: $caller_file_path})
-                        OPTIONAL MATCH (called:Class {name: $called_name, path: $called_file_path})
-                        OPTIONAL MATCH (called)-[:CONTAINS]->(init:Function)
-                        WHERE init.name IN ["__init__", "constructor"]
-                        WITH caller, COALESCE(init, called) as final_target
-                        WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
-                        RETURN count(*) as created
-                    """, call_params):
+                        OPTIONAL MATCH (called:Function {name: $called_name})
+                        WITH caller, called
+                        WHERE caller IS NOT NULL AND called IS NOT NULL
+                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    """, call_params)
 
-                         # Fallback: Relaxed Global Search (Caller: File -> Callee: Function)
-                         self._safe_run_create(session, """
-                            OPTIONAL MATCH (caller:File {path: $caller_file_path})
-                            OPTIONAL MATCH (called:Function {name: $called_name})
-                            WITH caller, called
-                            WHERE caller IS NOT NULL AND called IS NOT NULL
-                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
-                        """, call_params)
-
-    def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict):
+    def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict, job_id: str = None):
         """Create CALLS relationships for all functions after all files have been processed."""
-        debug_log(f"_create_all_function_calls called with {len(all_file_data)} files")
+        total = len(all_file_data)
+        if job_id:
+            self.job_manager.update_job(job_id, stage="function_calls", total_files=total, processed_files=0, current_file="")
+        debug_log(f"_create_all_function_calls called with {total} files")
         with self.driver.session() as session:
             for idx, file_data in enumerate(all_file_data):
-                debug_log(f"Processing file {idx+1}/{len(all_file_data)}: {file_data.get('path', 'unknown')}")
+                debug_log(f"Processing file {idx+1}/{total}: {file_data.get('path', 'unknown')}")
                 self._create_function_calls(session, file_data, imports_map)
+                if job_id:
+                    self.job_manager.update_job(job_id, processed_files=idx + 1)
 
     def _create_inheritance_links(self, session, file_data: Dict, imports_map: dict):
         """Create INHERITS relationships with a more robust resolution logic."""
@@ -885,15 +1216,20 @@ class GraphBuilder:
                         path=caller_file_path,
                         parent_name=base_name)
 
-    def _create_all_inheritance_links(self, all_file_data: list[Dict], imports_map: dict):
+    def _create_all_inheritance_links(self, all_file_data: list[Dict], imports_map: dict, job_id: str = None):
         """Create INHERITS relationships for all classes after all files have been processed."""
+        total = len(all_file_data)
+        if job_id:
+            self.job_manager.update_job(job_id, stage="inheritance", total_files=total, processed_files=0, current_file="")
         with self.driver.session() as session:
-            for file_data in all_file_data:
+            for idx, file_data in enumerate(all_file_data):
                 # Handle C# separately
                 if file_data.get('lang') == 'c_sharp':
                     self._create_csharp_inheritance_and_interfaces(session, file_data, imports_map)
                 else:
                     self._create_inheritance_links(session, file_data, imports_map)
+                if job_id:
+                    self.job_manager.update_job(job_id, processed_files=idx + 1)
                 
     def delete_file_from_graph(self, path: str):
         """Deletes a file and all its contained elements and relationships."""
@@ -1245,11 +1581,11 @@ class GraphBuilder:
                 curr = curr.parent
 
             spec = None
+            ignore_patterns = list(DEFAULT_IGNORE_PATTERNS)
             if cgcignore_path:
                 with open(cgcignore_path) as f:
                     user_patterns = [line.strip() for line in f.read().splitlines() if line.strip() and not line.strip().startswith('#')]
                 ignore_patterns = DEFAULT_IGNORE_PATTERNS + user_patterns
-                spec = pathspec.PathSpec.from_lines('gitwildmatch', ignore_patterns)
             else:
                 # No .cgcignore found — create one in the project root with default patterns
                 # so the user can see and customize what's being ignored
@@ -1264,15 +1600,36 @@ class GraphBuilder:
                     info_logger(f"Created default .cgcignore at {new_cgcignore}")
                 except OSError as e:
                     warning_logger(f"Could not create .cgcignore at {new_cgcignore}: {e}")
-                spec = pathspec.PathSpec.from_lines('gitwildmatch', DEFAULT_IGNORE_PATTERNS)
+
+            # Load .gitignore patterns if present (complements .cgcignore)
+            project_root = path.resolve() if path.is_dir() else path.resolve().parent
+            gitignore_path = project_root / ".gitignore"
+            if gitignore_path.exists():
+                try:
+                    with open(gitignore_path) as f:
+                        gitignore_patterns = [line.strip() for line in f.read().splitlines()
+                                              if line.strip() and not line.strip().startswith('#')]
+                    ignore_patterns = ignore_patterns + gitignore_patterns
+                    info_logger(f"Loaded {len(gitignore_patterns)} patterns from .gitignore")
+                except Exception as e:
+                    warning_logger(f"Could not load .gitignore: {e}")
+
+            spec = pathspec.PathSpec.from_lines('gitwildmatch', ignore_patterns)
 
             supported_extensions = self.parsers.keys()
             all_files = path.rglob("*") if path.is_dir() else [path]
 
-            # Previously only files with supported extensions were indexed.
-            # Updated to include all files so that unsupported file types
-            # can still be represented as minimal File nodes in the graph.
-            files = [f for f in all_files if f.is_file()]
+            # Single stat() per entry — cache results to avoid repeated syscalls
+            import stat as stat_mod
+            file_stat_cache = {}  # Path -> os.stat_result
+            for f in all_files:
+                try:
+                    st = f.stat()
+                    if stat_mod.S_ISREG(st.st_mode):
+                        file_stat_cache[f] = st
+                except OSError:
+                    pass
+            files = list(file_stat_cache.keys())
 
             # Filter default ignored directories
             ignore_dirs_str = get_config_value("IGNORE_DIRS") or ""
@@ -1282,17 +1639,57 @@ class GraphBuilder:
                     kept_files = []
                     for f in files:
                         try:
-                            # Check if any parent directory in the relative path is in ignore list
                             parts = set(p.lower() for p in f.relative_to(path).parent.parts)
                             if not parts.intersection(ignore_dirs):
                                 kept_files.append(f)
-                            else:
-                                # debug_log(f"Skipping default ignored file: {f}")
-                                pass
                         except ValueError:
                              kept_files.append(f)
                     files = kept_files
             
+            # Enforce MAX_FILE_SIZE_MB (uses cached stat)
+            max_file_size_mb = get_config_value("MAX_FILE_SIZE_MB")
+            if max_file_size_mb and max_file_size_mb != "unlimited":
+                try:
+                    max_bytes = float(max_file_size_mb) * 1024 * 1024
+                    before_count = len(files)
+                    files = [f for f in files if file_stat_cache[f].st_size <= max_bytes]
+                    skipped = before_count - len(files)
+                    if skipped > 0:
+                        info_logger(f"Skipped {skipped} files exceeding {max_file_size_mb}MB")
+                except (ValueError, OSError) as e:
+                    warning_logger(f"Could not apply MAX_FILE_SIZE_MB filter: {e}")
+
+            # Enforce IGNORE_TEST_FILES
+            ignore_tests = (get_config_value("IGNORE_TEST_FILES") or "false").lower() == "true"
+            if ignore_tests and path.is_dir():
+                test_dir_names = {"test", "tests", "spec", "__tests__", "testing"}
+                before_count = len(files)
+                kept = []
+                for f in files:
+                    try:
+                        parts = set(p.lower() for p in f.relative_to(path).parts)
+                        if not parts.intersection(test_dir_names):
+                            kept.append(f)
+                    except ValueError:
+                        kept.append(f)
+                files = kept
+                skipped = before_count - len(files)
+                if skipped > 0:
+                    info_logger(f"Skipped {skipped} test files (IGNORE_TEST_FILES=true)")
+
+            # Enforce MAX_DEPTH
+            max_depth = get_config_value("MAX_DEPTH")
+            if max_depth and max_depth != "unlimited" and path.is_dir():
+                try:
+                    max_d = int(max_depth)
+                    before_count = len(files)
+                    files = [f for f in files if len(f.relative_to(path).parts) <= max_d]
+                    skipped = before_count - len(files)
+                    if skipped > 0:
+                        info_logger(f"Skipped {skipped} files beyond depth {max_d}")
+                except (ValueError, OSError) as e:
+                    warning_logger(f"Could not apply MAX_DEPTH filter: {e}")
+
             if spec:
                 filtered_files = []
                 for f in files:
@@ -1310,40 +1707,139 @@ class GraphBuilder:
             if job_id:
                 self.job_manager.update_job(job_id, total_files=len(files))
             
-            debug_log("Starting pre-scan to build imports map...")
-            imports_map = self._pre_scan_for_imports(files)
-            debug_log(f"Pre-scan complete. Found {len(imports_map)} definitions.")
+            # --- #5: Incremental indexing — detect changed files ---
+            use_cache = (get_config_value("PARSE_CACHE_ENABLED") or "false").lower() == "true"
+            repo_key = str(path.resolve())
+            index_meta = self._load_index_meta() if use_cache else {}
+            repo_meta = index_meta.get(repo_key, {})
 
+            # Check if this repo already has data in DB; if not (e.g. --force wiped it),
+            # ignore stale meta and do full index
+            repo_exists_in_db = False
+            if use_cache and repo_meta:
+                try:
+                    with self.driver.session() as session:
+                        r = session.run("MATCH (f:File) WHERE f.path STARTS WITH $p RETURN count(f) AS c",
+                                        p=repo_key).single()
+                        repo_exists_in_db = r is not None and r['c'] > 0
+                except Exception:
+                    pass
+                if not repo_exists_in_db:
+                    info_logger("DB has no data for this repo — ignoring stale cache meta, doing full index")
+                    repo_meta = {}
+
+            changed_files = []
+            unchanged_files = []
+            for f in files:
+                st = file_stat_cache.get(f)
+                fp = f"{st.st_mtime_ns}:{st.st_size}" if st else self._file_fingerprint(f)
+                cached_fp = repo_meta.get(str(f.resolve()))
+                if use_cache and repo_exists_in_db and cached_fp == fp:
+                    unchanged_files.append(f)
+                else:
+                    changed_files.append(f)
+
+            if use_cache and unchanged_files:
+                info_logger(f"Incremental: {len(unchanged_files)} unchanged, {len(changed_files)} to process")
+                files_to_process = changed_files
+            else:
+                files_to_process = files
+
+            # --- #6: Use CREATE instead of MERGE for first-time index ---
+            first_index = self._is_db_empty()
+            if first_index:
+                info_logger("First-time index detected — using CREATE for faster writes")
+
+            # --- Single-pass parsing with #8 parse cache ---
+            debug_log("Starting single-pass parsing...")
             all_file_data = []
-
+            minimal_file_nodes = []
             processed_count = 0
-            for file in files:
+            new_meta = dict(repo_meta)  # copy existing fingerprints
+
+            for file in files_to_process:
                 if file.is_file():
                     if job_id:
                         self.job_manager.update_job(job_id, current_file=str(file))
                     repo_path = path.resolve() if path.is_dir() else file.parent.resolve()
-                    file_data = self.parse_file(repo_path, file, is_dependency)
-                    # Previously only files with supported extensions were indexed.
-                    # Updated to include all files so that unsupported file types
-                    # can still be represented as minimal File nodes in the graph.
+
+                    # #8: Try parse cache first
+                    file_data = None
+                    if use_cache:
+                        file_data = self._load_cached_parse(file)
+                        if file_data:
+                            debug_log(f"Cache hit: {file}")
+
+                    if file_data is None:
+                        file_data = self.parse_file(repo_path, file, is_dependency)
+                        if use_cache and "error" not in file_data:
+                            self._save_parse_cache(file, file_data)
+
                     if "error" not in file_data:
-                        self.add_file_to_graph(file_data, repo_name, imports_map)
                         all_file_data.append(file_data)
-
-                    # Previously only files with supported extensions were indexed.
-                    # Updated to include all files so that unsupported file types
-                    # can still be represented as minimal File nodes in the graph.
                     else:
-                        # create minimal node if parser not available
-                        self.add_minimal_file_node(file, repo_path, is_dependency)
-                    processed_count += 1
+                        minimal_file_nodes.append((file, repo_path))
 
+                    # Update fingerprint
+                    try:
+                        new_meta[str(file.resolve())] = self._file_fingerprint(file)
+                    except OSError:
+                        pass
+
+                    processed_count += 1
                     if job_id:
                         self.job_manager.update_job(job_id, processed_files=processed_count)
                     await asyncio.sleep(0.01)
 
-            self._create_all_inheritance_links(all_file_data, imports_map)
-            self._create_all_function_calls(all_file_data, imports_map)
+            debug_log(f"Parsed {len(all_file_data)} files. Building imports map...")
+
+            # Build imports_map from parsed data (replaces _pre_scan_for_imports)
+            imports_map = {}
+            for fd in all_file_data:
+                file_path_str = str(Path(fd['path']).resolve())
+                for func in fd.get('functions', []):
+                    name = func['name']
+                    if name not in imports_map:
+                        imports_map[name] = []
+                    imports_map[name].append(file_path_str)
+                for cls in fd.get('classes', []):
+                    name = cls['name']
+                    if name not in imports_map:
+                        imports_map[name] = []
+                    imports_map[name].append(file_path_str)
+                for iface in fd.get('interfaces', []):
+                    name = iface['name']
+                    if name not in imports_map:
+                        imports_map[name] = []
+                    imports_map[name].append(file_path_str)
+                for trait in fd.get('traits', []):
+                    name = trait['name']
+                    if name not in imports_map:
+                        imports_map[name] = []
+                    imports_map[name].append(file_path_str)
+
+            debug_log(f"Imports map built with {len(imports_map)} definitions. Writing to graph...")
+
+            # --- Bulk graph write: collect all data, then write by type ---
+            self._bulk_write_to_graph(all_file_data, str(path.resolve()), write_cmd="CREATE" if first_index else "MERGE")
+
+            # Write minimal nodes for unsupported files
+            for file, repo_p in minimal_file_nodes:
+                self.add_minimal_file_node(file, repo_p, is_dependency)
+
+            self._create_all_inheritance_links(all_file_data, imports_map, job_id=job_id)
+
+            # --- #7: Skip function calls if configured ---
+            skip_calls = (get_config_value("SKIP_FUNCTION_CALLS") or "false").lower() == "true"
+            if skip_calls:
+                info_logger("SKIP_FUNCTION_CALLS=true — skipping function call relationship creation")
+            else:
+                self._create_all_function_calls(all_file_data, imports_map, job_id=job_id)
+
+            # --- #5: Save index metadata ---
+            if use_cache:
+                index_meta[repo_key] = new_meta
+                self._save_index_meta(index_meta)
             
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.COMPLETED, end_time=datetime.now())
