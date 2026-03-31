@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+import json as json_mod
 import re
 from codegraphcontext.utils.debug_log import debug_log, info_logger, error_logger, warning_logger
 from codegraphcontext.utils.tree_sitter_manager import execute_query
@@ -106,6 +107,9 @@ class JavaTreeSitterParser:
                     # results for variables query
                     parsed_variables = self._parse_variables(results, source_code, path)
 
+            # Extract field declarations (with annotations, types, is_final)
+            field_declarations = self._extract_field_declarations(tree.root_node, path)
+
             return {
                 "path": str(path),
                 "functions": parsed_functions,
@@ -113,6 +117,7 @@ class JavaTreeSitterParser:
                 "variables": parsed_variables,
                 "imports": parsed_imports,
                 "function_calls": parsed_calls,
+                "field_declarations": field_declarations,
                 "is_dependency": is_dependency,
                 "lang": self.language_name,
             }
@@ -154,6 +159,77 @@ class JavaTreeSitterParser:
         if not node: return ""
         return node.text.decode("utf-8")
 
+    def _extract_annotations(self, node) -> list:
+        """Extract annotations from a class/method declaration's modifiers."""
+        decorators = []
+        modifiers = node.child_by_field_name('modifiers')
+        if not modifiers:
+            # Check parent for decorated_definition pattern
+            for child in node.children:
+                if child.type == 'modifiers':
+                    modifiers = child
+                    break
+        if modifiers:
+            for child in modifiers.children:
+                if child.type in ('marker_annotation', 'annotation'):
+                    decorators.append('@' + self._get_node_text(child).lstrip('@'))
+        return decorators
+
+    def _extract_field_declarations(self, root_node, path, class_context=None):
+        """Extract field declarations with type, annotations, and is_final."""
+        fields = []
+        for node in self._walk_nodes(root_node, 'field_declaration'):
+            # Find modifiers (may be named child or positional child)
+            modifiers = None
+            for child in node.children:
+                if child.type == 'modifiers':
+                    modifiers = child
+                    break
+
+            decorators = []
+            is_final = False
+            if modifiers:
+                for child in modifiers.children:
+                    if child.type in ('marker_annotation', 'annotation'):
+                        decorators.append('@' + self._get_node_text(child).lstrip('@'))
+                    if child.type == 'final' or self._get_node_text(child) == 'final':
+                        is_final = True
+
+            type_node = node.child_by_field_name('type')
+            if not type_node:
+                # Fallback: find type_identifier child
+                for child in node.children:
+                    if child.type in ('type_identifier', 'generic_type', 'scoped_type_identifier'):
+                        type_node = child
+                        break
+            field_type = self._get_node_text(type_node) if type_node else None
+
+            for child in node.children:
+                if child.type == 'variable_declarator':
+                    name_node = child.child_by_field_name('name')
+                    if not name_node:
+                        name_node = next((c for c in child.children if c.type == 'identifier'), None)
+                    if name_node and field_type:
+                        ctx_name, ctx_type, _ = self._get_parent_context(node)
+                        fields.append({
+                            'name': self._get_node_text(name_node),
+                            'type': field_type,
+                            'decorators': decorators,
+                            'is_final': is_final,
+                            'class_context': ctx_name if ctx_type and 'class' in ctx_type else class_context,
+                            'line_number': node.start_point[0] + 1,
+                            'path': str(path),
+                            'lang': self.language_name,
+                        })
+        return fields
+
+    def _walk_nodes(self, node, target_type):
+        """Recursively walk AST and yield nodes of target type."""
+        if node.type == target_type:
+            yield node
+        for child in node.children:
+            yield from self._walk_nodes(child, target_type)
+
     def _parse_functions(self, captures: list, source_code: str, path: Path) -> list[Dict[str, Any]]:
         functions = []
         # Group by node identity or stable key to avoid duplicates
@@ -176,9 +252,27 @@ class JavaTreeSitterParser:
                         
                         params_node = node.child_by_field_name("parameters")
                         parameters = []
+                        parameter_types = []
                         if params_node:
                             params_text = self._get_node_text(params_node)
                             parameters = self._extract_parameter_names(params_text)
+                            # Extract typed parameters
+                            for p in params_node.children:
+                                if p.type == 'formal_parameter':
+                                    p_type = p.child_by_field_name('type')
+                                    p_name = p.child_by_field_name('name')
+                                    if p_type and p_name:
+                                        parameter_types.append({
+                                            'name': self._get_node_text(p_name),
+                                            'type': self._get_node_text(p_type)
+                                        })
+
+                        # Extract return type
+                        return_type_node = node.child_by_field_name("type")
+                        return_type = self._get_node_text(return_type_node) if return_type_node else None
+
+                        # Extract annotations/decorators
+                        decorators = self._extract_annotations(node)
 
                         source_text = self._get_node_text(node)
                         
@@ -188,6 +282,9 @@ class JavaTreeSitterParser:
                         func_data = {
                             "name": func_name,
                             "parameters": parameters,
+                            "parameter_types": json_mod.dumps(parameter_types) if parameter_types else None,
+                            "return_type": return_type,
+                            "decorators": decorators,
                             "line_number": start_line,
                             "end_line": end_line,
                             "path": str(path),
@@ -260,11 +357,15 @@ class JavaTreeSitterParser:
                                     if child.type in ('type_identifier', 'generic_type', 'scoped_type_identifier'):
                                         bases.append(self._get_node_text(child))
 
+                        # Extract class annotations
+                        class_decorators = self._extract_annotations(node)
+
                         class_data = {
                             "name": class_name,
                             "line_number": start_line,
                             "end_line": end_line,
                             "bases": bases,
+                            "decorators": class_decorators,
                             "path": str(path),
                             "lang": self.language_name,
                         }
