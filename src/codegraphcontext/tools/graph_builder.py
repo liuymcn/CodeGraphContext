@@ -1252,6 +1252,21 @@ class GraphBuilder:
                     path=caller_file_path,
                     parent_name=target_class_name,
                     resolved_parent_file_path=resolved_path)
+                else:
+                    # DB fallback: search within same repo when imports_map fails
+                    repo_prefix = str(Path(file_data.get('repo_path', caller_file_path)).resolve()) + "/"
+                    # Strip generic type params: BaseDao<User> → BaseDao
+                    clean_name = target_class_name.split('<')[0].split('(')[0].strip()
+                    session.run("""
+                        MATCH (child:Class {name: $child_name, path: $child_path})
+                        MATCH (parent) WHERE (parent:Class OR parent:Interface) AND parent.name = $parent_name
+                        AND parent.path STARTS WITH $repo_prefix
+                        MERGE (child)-[:INHERITS]->(parent)
+                    """,
+                    child_name=class_item['name'],
+                    child_path=caller_file_path,
+                    parent_name=clean_name,
+                    repo_prefix=repo_prefix)
 
 
     def _create_csharp_inheritance_and_interfaces(self, session, file_data: Dict, imports_map: dict):

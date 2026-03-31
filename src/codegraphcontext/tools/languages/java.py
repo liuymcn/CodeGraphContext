@@ -231,8 +231,15 @@ class JavaTreeSitterParser:
                         # Look for superclass (extends)
                         superclass_node = node.child_by_field_name('superclass')
                         if superclass_node:
-                            # In Java, superclass field usually points to a type node
-                            bases.append(self._get_node_text(superclass_node))
+                            # Extract type_identifier from superclass node (skip 'extends' keyword)
+                            for sc_child in superclass_node.children:
+                                if sc_child.type in ('type_identifier', 'generic_type', 'scoped_type_identifier'):
+                                    bases.append(self._get_node_text(sc_child))
+                                    break
+                            else:
+                                # Fallback: strip keyword manually
+                                text = self._get_node_text(superclass_node)
+                                bases.append(text.replace('extends ', '').strip())
 
                         # Look for super_interfaces (implements)
                         interfaces_node = node.child_by_field_name('interfaces')
