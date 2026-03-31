@@ -753,6 +753,33 @@ class GraphBuilder:
                     MERGE (c)-[:INCLUDES]->(m)
                 """, items=all_module_inclusions)
 
+            # 12. Field declarations as Variable nodes (with decorators, type, is_final)
+            all_fields = []
+            for fd in all_file_data:
+                file_path_str = str(Path(fd['path']).resolve())
+                for field in fd.get('field_declarations', []):
+                    all_fields.append({
+                        'name': field['name'],
+                        'type': field.get('type', ''),
+                        'decorators': field.get('decorators', []),
+                        'is_final': field.get('is_final', False),
+                        'class_context': field.get('class_context', ''),
+                        'line_number': field.get('line_number', 0),
+                        '_file_path': file_path_str,
+                        'lang': field.get('lang', ''),
+                    })
+            if all_fields:
+                session.run(f"""
+                    UNWIND $items AS item
+                    MATCH (f:File {{path: item._file_path}})
+                    {write_cmd} (v:Variable {{name: item.name, path: item._file_path, line_number: item.line_number}})
+                    SET v.type = item.type, v.decorators = item.decorators,
+                        v.is_final = item.is_final, v.class_context = item.class_context,
+                        v.lang = item.lang
+                    {write_cmd} (f)-[:CONTAINS]->(v)
+                """, items=all_fields)
+                debug_log(f"Wrote {len(all_fields)} field declarations")
+
         debug_log(f"Bulk write complete for {len(all_file_data)} files")
 
     def add_file_to_graph(self, file_data: Dict, repo_name: str, imports_map: dict, use_create: bool = False):
@@ -1099,11 +1126,7 @@ class GraphBuilder:
             caller_context = call.get('context')
             if caller_context and len(caller_context) == 3 and caller_context[0] is not None:
                 caller_name, context_type, caller_line_number = caller_context
-                
-                # Determine caller label from context_type (avoids COALESCE guessing)
                 caller_label = "Class" if context_type and 'class' in context_type else "Function"
-                
-                # Repo path prefix for fallback scope (trailing slash prevents prefix collision)
                 repo_path_prefix = str(Path(file_data.get('repo_path', caller_file_path)).resolve()) + "/"
                 
                 call_params = {
@@ -1115,7 +1138,9 @@ class GraphBuilder:
                     'line_number': call['line_number'],
                     'args': call.get('args', []),
                     'full_call_name': call.get('full_name', called_name),
-                    'repo_path_prefix': repo_path_prefix
+                    'repo_path_prefix': repo_path_prefix,
+                    'confidence': 0.85,
+                    'resolved_by': 'context_type_exact'
                 }
                 
                 # Primary: precise caller label + COALESCE for callee
@@ -1127,22 +1152,23 @@ class GraphBuilder:
                     WHERE init.name IN ["__init__", "constructor"]
                     WITH caller, COALESCE(tf, init, tc) AS target
                     WHERE target IS NOT NULL
-                    MERGE (caller)-[:CALLS {{line_number: $line_number, args: $args, full_call_name: $full_call_name}}]->(target)
+                    MERGE (caller)-[:CALLS {{line_number: $line_number, args: $args, full_call_name: $full_call_name, confidence: $confidence, resolved_by: $resolved_by}}]->(target)
                     RETURN count(*) as created
                 """, call_params):
                     # Fallback: search within same repo only
+                    call_params['confidence'] = 0.30
+                    call_params['resolved_by'] = 'fallback_repo_scope'
                     self._safe_run_create(session, f"""
                         MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_file_path}})
                         OPTIONAL MATCH (called:Function {{name: $called_name}})
                         WHERE called.path STARTS WITH $repo_path_prefix
                         WITH caller, called
                         WHERE called IS NOT NULL
-                        MERGE (caller)-[:CALLS {{line_number: $line_number, args: $args, full_call_name: $full_call_name}}]->(called)
+                        MERGE (caller)-[:CALLS {{line_number: $line_number, args: $args, full_call_name: $full_call_name, confidence: $confidence, resolved_by: $resolved_by}}]->(called)
                     """, call_params)
             else:
                 # File-level calls
                 repo_path_prefix = str(Path(file_data.get('repo_path', caller_file_path)).resolve()) + "/"
-                
                 call_params = {
                     'caller_file_path': caller_file_path,
                     'called_name': called_name,
@@ -1150,10 +1176,11 @@ class GraphBuilder:
                     'line_number': call['line_number'],
                     'args': call.get('args', []),
                     'full_call_name': call.get('full_name', called_name),
-                    'repo_path_prefix': repo_path_prefix
+                    'repo_path_prefix': repo_path_prefix,
+                    'confidence': 0.75,
+                    'resolved_by': 'imports_map_unique'
                 }
                 
-                # Primary: File caller + COALESCE for callee
                 if not self._safe_run_create(session, """
                     MATCH (caller:File {path: $caller_file_path})
                     OPTIONAL MATCH (tf:Function {name: $called_name, path: $called_file_path})
@@ -1162,17 +1189,18 @@ class GraphBuilder:
                     WHERE init.name IN ["__init__", "constructor"]
                     WITH caller, COALESCE(tf, init, tc) AS target
                     WHERE target IS NOT NULL
-                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(target)
+                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, confidence: $confidence, resolved_by: $resolved_by}]->(target)
                     RETURN count(*) as created
                 """, call_params):
-                    # Fallback: search within same repo only
+                    call_params['confidence'] = 0.30
+                    call_params['resolved_by'] = 'fallback_repo_scope'
                     self._safe_run_create(session, """
                         MATCH (caller:File {path: $caller_file_path})
                         OPTIONAL MATCH (called:Function {name: $called_name})
                         WHERE called.path STARTS WITH $repo_path_prefix
                         With caller, called
                         WHERE called IS NOT NULL
-                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, confidence: $confidence, resolved_by: $resolved_by}]->(called)
                     """, call_params)
 
 
@@ -1802,6 +1830,12 @@ class GraphBuilder:
                 self.add_minimal_file_node(file, repo_p, is_dependency)
 
             self._create_all_inheritance_links(all_file_data, imports_map, job_id=job_id)
+
+            # --- V5.6: Create INJECTS relations from annotations ---
+            from .framework_detection import create_injection_relations
+            repo_prefix = str(path.resolve()) + "/"
+            with self.driver.session() as session:
+                create_injection_relations(session, all_file_data, repo_prefix)
 
             # --- #7: Skip function calls if configured ---
             skip_calls = (get_config_value("SKIP_FUNCTION_CALLS") or "false").lower() == "true"
