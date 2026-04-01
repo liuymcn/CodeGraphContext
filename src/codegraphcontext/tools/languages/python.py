@@ -146,14 +146,16 @@ class PythonTreeSitterParser:
             imports = self._find_imports(root_node)
             function_calls = self._find_calls(root_node)
             variables = self._find_variables(root_node)
+            field_declarations = self._extract_field_declarations(root_node, original_file_path)
 
             return {
-                "path": str(original_file_path), # Always return the original path
+                "path": str(original_file_path),
                 "functions": functions,
                 "classes": classes,
                 "variables": variables,
                 "imports": imports,
                 "function_calls": function_calls,
+                "field_declarations": field_declarations,
                 "is_dependency": is_dependency,
                 "lang": self.language_name,
             }
@@ -255,6 +257,8 @@ class PythonTreeSitterParser:
                     "line_number": node.start_point[0] + 1,
                     "end_line": func_node.end_point[0] + 1,
                     "args": args,
+                    "parameter_types": self._extract_param_types(func_node),
+                    "return_type": self._extract_return_type(func_node),
                     "cyclomatic_complexity": self._calculate_complexity(func_node),
                     "context": context,
                     "context_type": context_type,
@@ -292,11 +296,17 @@ class PythonTreeSitterParser:
 
                 context, _, _ = self._get_parent_context(class_node)
 
+                # Determine class_type: ABC → abstract_class, else class
+                is_abstract = 'ABC' in bases or any('abstractmethod' in d for d in decorators)
+                class_type = 'abstract_class' if is_abstract else 'class'
+
                 class_data = {
                     "name": name,
                     "line_number": node.start_point[0] + 1,
                     "end_line": class_node.end_point[0] + 1,
                     "bases": [b for b in bases if b],
+                    "is_abstract": is_abstract,
+                    "class_type": class_type,
                     "context": context,
                     "decorators": [d for d in decorators if d],
                     "lang": self.language_name,
@@ -535,6 +545,99 @@ class PythonTreeSitterParser:
                 variables.append(variable_data)
         return variables
 
+
+    def _extract_param_types(self, func_node):
+        """Extract parameter types from Python type annotations."""
+        params = func_node.child_by_field_name('parameters')
+        if not params:
+            return None
+        result = []
+        for child in params.children:
+            if child.type in ('typed_parameter', 'typed_default_parameter'):
+                name = None
+                ptype = None
+                for c in child.children:
+                    if c.type == 'identifier' and not name:
+                        name = self._get_node_text(c)
+                    elif c.type == 'type':
+                        ptype = self._get_node_text(c)
+                if name and name != 'self' and name != 'cls':
+                    result.append({"name": name, "type": ptype or "Any"})
+            elif child.type == 'identifier':
+                t = self._get_node_text(child)
+                if t not in ('self', 'cls'):
+                    result.append({"name": t, "type": "Any"})
+        if not result:
+            return None
+        import json as json_mod
+        return json_mod.dumps(result)
+
+    def _extract_return_type(self, func_node):
+        """Extract return type from Python -> annotation."""
+        ret = func_node.child_by_field_name('return_type')
+        if ret:
+            return self._get_node_text(ret)
+        return None
+
+    def _extract_field_declarations(self, root_node, path):
+        """Extract self.x = ... assignments in __init__ as field declarations."""
+        fields = []
+        for node in root_node.children:
+            if node.type != 'class_definition':
+                continue
+            class_name = self._get_node_text(node.child_by_field_name('name')) if node.child_by_field_name('name') else None
+            body = node.child_by_field_name('body')
+            if not body:
+                continue
+            for member in body.children:
+                if member.type != 'function_definition':
+                    continue
+                fn_name = member.child_by_field_name('name')
+                if not fn_name or self._get_node_text(fn_name) != '__init__':
+                    continue
+                # Extract type hints from __init__ params
+                param_types = {}
+                params = member.child_by_field_name('parameters')
+                if params:
+                    for p in params.children:
+                        if p.type in ('typed_parameter', 'typed_default_parameter'):
+                            pname, ptype = None, None
+                            for c in p.children:
+                                if c.type == 'identifier' and not pname:
+                                    pname = self._get_node_text(c)
+                                elif c.type == 'type':
+                                    ptype = self._get_node_text(c)
+                            if pname:
+                                param_types[pname] = ptype
+                # Walk __init__ body for self.x = ... assignments
+                fn_body = member.child_by_field_name('body')
+                if not fn_body:
+                    continue
+                for stmt in fn_body.children:
+                    expr = None
+                    if stmt.type == 'expression_statement':
+                        expr = stmt.children[0] if stmt.children else None
+                    elif stmt.type == 'assignment':
+                        expr = stmt
+                    if expr and expr.type == 'assignment':
+                            left = expr.child_by_field_name('left')
+                            right = expr.child_by_field_name('right')
+                            if left and left.type == 'attribute':
+                                obj = left.child_by_field_name('object')
+                                attr = left.child_by_field_name('attribute')
+                                if obj and self._get_node_text(obj) == 'self' and attr:
+                                    fname = self._get_node_text(attr)
+                                    ftype = param_types.get(fname)
+                                    if not ftype and right:
+                                        # Infer from right side: ClassName() → ClassName
+                                        rt = self._get_node_text(right)
+                                        if rt and '(' in rt:
+                                            val = rt.split('(')[0].strip()
+                                            if val and val[0].isupper():
+                                                ftype = val
+                                    fields.append({'name': fname, 'type': ftype, 'class_context': class_name,
+                                                   'line_number': stmt.start_point[0] + 1, 'path': str(path), 'lang': self.language_name})
+        return fields
 def pre_scan_python(files: list[Path], parser_wrapper) -> dict:
     """Scans Python files to create a map of class/function names to their file paths."""
     imports_map = {}

@@ -57,10 +57,11 @@ def create_injection_relations(session, all_file_data, repo_prefix):
                             if _create_injects(session, cls_name, param['type'], param.get('name', ''), repo_prefix):
                                 total += 1
 
-            # 3. Lombok @RequiredArgsConstructor → final fields = injection
+            # 3. Lombok: @RequiredArgsConstructor → final fields, @AllArgsConstructor → all fields
             if cls_decorators.intersection(LOMBOK_CONSTRUCTOR_ANNOTATIONS):
+                all_args = '@AllArgsConstructor' in cls_decorators
                 for field in fields:
-                    if field.get('class_context') == cls_name and field.get('is_final'):
+                    if field.get('class_context') == cls_name and (all_args or field.get('is_final')):
                         if _create_injects(session, cls_name, field.get('type'), field.get('name'), repo_prefix):
                             total += 1
 

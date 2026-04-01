@@ -180,6 +180,7 @@ class JavascriptTreeSitterParser:
         imports = self._find_imports(root_node)
         function_calls = self._find_calls(root_node)
         variables = self._find_variables(root_node)
+        field_declarations = self._extract_field_declarations(root_node, path)
 
         return {
             "path": str(path),
@@ -188,6 +189,7 @@ class JavascriptTreeSitterParser:
             "variables": variables,
             "imports": imports,
             "function_calls": function_calls,
+            "field_declarations": field_declarations,
             "is_dependency": is_dependency,
             "lang": self.language_name,
         }
@@ -283,6 +285,8 @@ class JavascriptTreeSitterParser:
                 "line_number": func_node.start_point[0] + 1,
                 "end_line": func_node.end_point[0] + 1,
                 "args": args,
+                "parameter_types": self._extract_param_types(func_node),
+                "return_type": self._extract_return_type(func_node),
                 "lang": self.language_name,
                 "is_dependency": False,
             }
@@ -345,6 +349,86 @@ class JavascriptTreeSitterParser:
         return params
 
 
+    def _extract_param_types(self, func_node):
+        """Extract parameter types from TS type annotations. Returns JSON string or None."""
+        params_node = func_node.child_by_field_name('parameters')
+        if not params_node:
+            return None
+        result = []
+        for child in params_node.children:
+            if child.type in ('required_parameter', 'optional_parameter'):
+                name, ptype = None, None
+                for c in child.children:
+                    if c.type == 'identifier':
+                        name = self._get_node_text(c)
+                    elif c.type == 'type_annotation':
+                        for tc in c.children:
+                            if tc.type != ':':
+                                ptype = self._get_node_text(tc)
+                                break
+                if name:
+                    result.append({"name": name, "type": ptype or "any"})
+        if not result:
+            return None
+        import json as json_mod
+        return json_mod.dumps(result)
+
+    def _extract_return_type(self, func_node):
+        """Extract return type from TS type annotation."""
+        ret = func_node.child_by_field_name('return_type')
+        if ret:
+            for c in ret.children:
+                if c.type != ':':
+                    return self._get_node_text(c)
+        return None
+
+    def _extract_field_declarations(self, root_node, path):
+        """Extract class fields: public_field_definition + constructor private/public/readonly params."""
+        fields = []
+        for node in root_node.children:
+            cn = node
+            if cn.type == 'export_statement':
+                cn = next((c for c in cn.children if c.type == 'class_declaration'), None)
+            if not cn or cn.type != 'class_declaration':
+                continue
+            class_name = self._get_node_text(cn.child_by_field_name('name')) if cn.child_by_field_name('name') else None
+            body = cn.child_by_field_name('body')
+            if not body:
+                continue
+            for member in body.children:
+                if member.type == 'public_field_definition':
+                    fname, ftype = None, None
+                    for c in member.children:
+                        if c.type in ('property_identifier', 'identifier'):
+                            fname = self._get_node_text(c)
+                        elif c.type == 'type_annotation':
+                            for tc in c.children:
+                                if tc.type != ':':
+                                    ftype = self._get_node_text(tc)
+                    if fname:
+                        fields.append({'name': fname, 'type': ftype, 'class_context': class_name,
+                                       'line_number': member.start_point[0] + 1, 'path': str(path), 'lang': self.language_name})
+                if member.type == 'method_definition':
+                    mn = member.child_by_field_name('name')
+                    if mn and self._get_node_text(mn) == 'constructor':
+                        params = member.child_by_field_name('parameters')
+                        if not params:
+                            continue
+                        for p in params.children:
+                            if p.type == 'required_parameter' and any(c.type in ('accessibility_modifier', 'readonly') for c in p.children):
+                                pname, ptype = None, None
+                                for c in p.children:
+                                    if c.type == 'identifier':
+                                        pname = self._get_node_text(c)
+                                    elif c.type == 'type_annotation':
+                                        for tc in c.children:
+                                            if tc.type != ':':
+                                                ptype = self._get_node_text(tc)
+                                if pname:
+                                    fields.append({'name': pname, 'type': ptype, 'class_context': class_name,
+                                                   'line_number': p.start_point[0] + 1, 'path': str(path), 'lang': self.language_name})
+        return fields
+
     def _get_jsdoc_comment(self, func_node):
         """Extract JSDoc comment preceding the function."""
         # Look for comments before the function
@@ -383,6 +467,7 @@ class JavascriptTreeSitterParser:
                     "line_number": class_node.start_point[0] + 1,
                     "end_line": class_node.end_point[0] + 1,
                     "bases": bases,
+                    "class_type": "class",
                     "context": None,
                     "decorators": [],
                     "lang": self.language_name,
@@ -530,6 +615,11 @@ class JavascriptTreeSitterParser:
                     if value_type == "call_expression":
                         func_node = value_node.child_by_field_name("function")
                         value = self._get_node_text(func_node) if func_node else name
+                    elif value_type == "new_expression":
+                        constructor = value_node.child_by_field_name("constructor")
+                        if constructor:
+                            type_text = self._get_node_text(constructor)
+                        value = self._get_node_text(value_node)
                     else:
                         value = self._get_node_text(value_node)
 

@@ -325,18 +325,26 @@ class JavaTreeSitterParser:
                         source_text = self._get_node_text(node)
                         
                         bases = []
+                        extends_bases = []
+                        implements_bases = []
+                        is_interface = node.type == 'interface_declaration'
+
                         # Look for superclass (extends)
                         superclass_node = node.child_by_field_name('superclass')
                         if superclass_node:
                             # Extract type_identifier from superclass node (skip 'extends' keyword)
                             for sc_child in superclass_node.children:
                                 if sc_child.type in ('type_identifier', 'generic_type', 'scoped_type_identifier'):
-                                    bases.append(self._get_node_text(sc_child))
+                                    b = self._get_node_text(sc_child)
+                                    bases.append(b)
+                                    extends_bases.append(b)
                                     break
                             else:
                                 # Fallback: strip keyword manually
                                 text = self._get_node_text(superclass_node)
-                                bases.append(text.replace('extends ', '').strip())
+                                b = text.replace('extends ', '').strip()
+                                bases.append(b)
+                                extends_bases.append(b)
 
                         # Look for super_interfaces (implements)
                         interfaces_node = node.child_by_field_name('interfaces')
@@ -351,20 +359,51 @@ class JavaTreeSitterParser:
                             if type_list:
                                 for child in type_list.children:
                                     if child.type in ('type_identifier', 'generic_type', 'scoped_type_identifier'):
-                                        bases.append(self._get_node_text(child))
+                                        b = self._get_node_text(child)
+                                        bases.append(b)
+                                        implements_bases.append(b)
                             else:
                                 for child in interfaces_node.children:
                                     if child.type in ('type_identifier', 'generic_type', 'scoped_type_identifier'):
-                                        bases.append(self._get_node_text(child))
+                                        b = self._get_node_text(child)
+                                        bases.append(b)
+                                        implements_bases.append(b)
 
                         # Extract class annotations
                         class_decorators = self._extract_annotations(node)
+
+                        # Determine class kind
+                        is_abstract = False
+                        is_enum = node.type == 'enum_declaration'
+                        modifiers = node.child_by_field_name('modifiers')
+                        if not modifiers:
+                            modifiers = next((c for c in node.children if c.type == 'modifiers'), None)
+                        if modifiers:
+                            for mc in modifiers.children:
+                                if self._get_node_text(mc) == 'abstract':
+                                    is_abstract = True
+
+                        # class_type: interface | abstract_class | enum | class
+                        if is_interface:
+                            class_type = 'interface'
+                        elif is_enum:
+                            class_type = 'enum'
+                        elif is_abstract:
+                            class_type = 'abstract_class'
+                        else:
+                            class_type = 'class'
 
                         class_data = {
                             "name": class_name,
                             "line_number": start_line,
                             "end_line": end_line,
                             "bases": bases,
+                            "extends_bases": extends_bases,
+                            "implements_bases": implements_bases,
+                            "is_interface": is_interface,
+                            "is_abstract": is_abstract,
+                            "is_enum": is_enum,
+                            "class_type": class_type,
                             "decorators": class_decorators,
                             "path": str(path),
                             "lang": self.language_name,

@@ -12,6 +12,10 @@ from datetime import datetime
 from ..core.database import DatabaseManager
 from ..core.jobs import JobManager, JobStatus
 from ..utils.debug_log import debug_log, info_logger, error_logger, warning_logger
+from .type_resolver import (
+    find_method_in_hierarchy, find_field_type_in_hierarchy, find_impl_class,
+    linear_ancestors, compute_mro, build_local_type_env, create_overrides,
+)
 
 # New imports for tree-sitter (using tree-sitter-language-pack)
 from tree_sitter import Language, Parser
@@ -1003,57 +1007,51 @@ class GraphBuilder:
             return False
 
     def _create_multi_candidate_calls(self, session, caller_label, caller_name, caller_file_path,
-                                       called_name, repo_prefix, call_line, call_args, full_call_name):
+                                       called_name, repo_prefix, call_line, call_args, full_call_name,
+                                       caller_line=0):
         """Create CALLS to matching targets. Tries arg-count filtering first (overload disambiguation)."""
         try:
             arg_count = len(call_args) if call_args else 0
 
             # Try overload disambiguation: filter by parameter count
             if arg_count > 0:
-                if caller_label == 'File':
-                    result = session.run("""
-                        MATCH (target:Function {name: $called_name})
-                        WHERE target.path STARTS WITH $repo_prefix
-                        AND target.parameter_types IS NOT NULL
-                        AND size(target.parameter_types) > 2
-                        RETURN target.path AS path, target.parameter_types AS ptypes
-                    """, called_name=called_name, repo_prefix=repo_prefix).data()
-                else:
-                    result = session.run("""
-                        MATCH (target:Function {name: $called_name})
-                        WHERE target.path STARTS WITH $repo_prefix
-                        AND target.parameter_types IS NOT NULL
-                        AND size(target.parameter_types) > 2
-                        RETURN target.path AS path, target.parameter_types AS ptypes
-                    """, called_name=called_name, repo_prefix=repo_prefix).data()
+                result = session.run("""
+                    MATCH (target:Function {name: $called_name})
+                    WHERE target.path STARTS WITH $repo_prefix
+                    AND target.parameter_types IS NOT NULL
+                    AND size(target.parameter_types) > 2
+                    RETURN target.path AS path, target.parameter_types AS ptypes, target.line_number AS tline
+                """, called_name=called_name, repo_prefix=repo_prefix).data()
 
-                # Count params in JSON string: count occurrences of "name"
+                # Count params in JSON string: count key occurrences
                 matched_by_count = []
                 for r in result:
                     ptypes = r.get('ptypes', '')
                     if isinstance(ptypes, str):
-                        param_count = ptypes.count('"name"')
+                        param_count = ptypes.count('"name":')
                         if param_count == arg_count:
-                            matched_by_count.append(r['path'])
+                            matched_by_count.append((r['path'], r['tline']))
 
                 if len(matched_by_count) == 1:
                     # Unique match by arg count — overload resolved!
+                    target_path, target_line = matched_by_count[0]
                     if caller_label == 'File':
                         session.run("""
                             MATCH (caller:File {path: $caller_path})
-                            MATCH (target:Function {name: $called_name, path: $target_path})
+                            MATCH (target:Function {name: $called_name, path: $target_path, line_number: $tline})
                             MERGE (caller)-[:CALLS {line_number: $line, args: $args, full_call_name: $fcn,
                                    confidence: 0.80, resolved_by: 'overload_by_arg_count'}]->(target)
                         """, caller_path=caller_file_path, called_name=called_name,
-                             target_path=matched_by_count[0], line=call_line, args=call_args, fcn=full_call_name)
+                             target_path=target_path, tline=target_line,
+                             line=call_line, args=call_args, fcn=full_call_name)
                     else:
                         session.run(f"""
-                            MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_path}})
-                            MATCH (target:Function {{name: $called_name, path: $target_path}})
+                            MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_path, line_number: $caller_line}})
+                            MATCH (target:Function {{name: $called_name, path: $target_path, line_number: $tline}})
                             MERGE (caller)-[:CALLS {{line_number: $line, args: $args, full_call_name: $fcn,
                                    confidence: 0.80, resolved_by: 'overload_by_arg_count'}}]->(target)
-                        """, caller_name=caller_name, caller_path=caller_file_path,
-                             called_name=called_name, target_path=matched_by_count[0],
+                        """, caller_name=caller_name, caller_path=caller_file_path, caller_line=caller_line,
+                             called_name=called_name, target_path=target_path, tline=target_line,
                              line=call_line, args=call_args, fcn=full_call_name)
                     return
 
@@ -1069,122 +1067,21 @@ class GraphBuilder:
                      repo_prefix=repo_prefix, line=call_line, args=call_args, fcn=full_call_name)
             else:
                 session.run(f"""
-                    MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_path}})
+                    MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_path, line_number: $caller_line}})
                     MATCH (target:Function {{name: $called_name}})
                     WHERE target.path STARTS WITH $repo_prefix
                     MERGE (caller)-[:CALLS {{line_number: $line, args: $args, full_call_name: $fcn,
                            confidence: 0.20, resolved_by: 'multi_candidate'}}]->(target)
-                """, caller_name=caller_name, caller_path=caller_file_path,
+                """, caller_name=caller_name, caller_path=caller_file_path, caller_line=caller_line,
                      called_name=called_name, repo_prefix=repo_prefix,
                      line=call_line, args=call_args, fcn=full_call_name)
         except Exception:
             pass
 
 
-    def _find_method_in_hierarchy(self, session, class_name, method_name, repo_prefix, language='java'):
-        """Find method by walking inheritance chain. Python uses MRO, others use linear lookup."""
-        if language == 'python':
-            ancestors = self._compute_mro(session, class_name, repo_prefix)
-        else:
-            ancestors = self._linear_ancestors(session, class_name, repo_prefix)
 
-        for ancestor in ancestors:
-            result = session.run("""
-                MATCH (c:Class {name: $cls})-[:CONTAINS]->(f:Function {name: $method})
-                WHERE c.path STARTS WITH $repo
-                RETURN f.path AS path, c.name AS owner_class
-                LIMIT 1
-            """, cls=ancestor, method=method_name, repo=repo_prefix).single()
-            if result:
-                return result
-        return None
 
-    def _linear_ancestors(self, session, class_name, repo_prefix):
-        """Ancestor chain — follows ALL parents (handles implements + extends)."""
-        chain = []
-        visited = set()
-        queue = [class_name]
-        while queue:
-            current = queue.pop(0)
-            if current in visited:
-                continue
-            visited.add(current)
-            chain.append(current)
-            parents = session.run("""
-                MATCH (c:Class {name: $cls})-[:INHERITS]->(p)
-                WHERE c.path STARTS WITH $repo
-                RETURN p.name AS name
-            """, cls=current, repo=repo_prefix).data()
-            for p in parents:
-                if p['name'] not in visited:
-                    queue.append(p['name'])
-        return chain
 
-    def _compute_mro(self, session, class_name, repo_prefix):
-        """C3 linearization for Python multiple inheritance."""
-        parents = []
-        results = session.run("""
-            MATCH (c:Class {name: $cls})-[:INHERITS]->(p)
-            WHERE c.path STARTS WITH $repo
-            RETURN p.name AS name
-        """, cls=class_name, repo=repo_prefix).data()
-        parents = [r['name'] for r in results]
-
-        if not parents:
-            return [class_name]
-
-        parent_mros = [self._compute_mro(session, p, repo_prefix) for p in parents]
-        try:
-            return [class_name] + self._c3_merge([list(m) for m in parent_mros] + [list(parents)])
-        except Exception:
-            return [class_name] + parents
-
-    @staticmethod
-    def _c3_merge(sequences):
-        """C3 merge algorithm."""
-        result = []
-        seqs = [s for s in sequences if s]
-        while seqs:
-            for seq in seqs:
-                head = seq[0]
-                if all(head not in s[1:] for s in seqs):
-                    result.append(head)
-                    seqs = [[x for x in s if x != head] for s in seqs]
-                    seqs = [s for s in seqs if s]
-                    break
-            else:
-                # Cycle or inconsistent — fallback
-                for seq in seqs:
-                    result.extend(seq)
-                break
-        return result
-
-    def _find_field_type_in_hierarchy(self, session, class_name, field_name, repo_prefix, language='java'):
-        """Find field type by walking inheritance chain."""
-        if language == 'python':
-            ancestors = self._compute_mro(session, class_name, repo_prefix)
-        else:
-            ancestors = self._linear_ancestors(session, class_name, repo_prefix)
-
-        for ancestor in ancestors:
-            result = session.run("""
-                MATCH (v:Variable {name: $field, class_context: $cls})
-                WHERE v.path STARTS WITH $repo
-                RETURN v.type AS type
-                LIMIT 1
-            """, cls=ancestor, field=field_name, repo=repo_prefix).single()
-            if result and result.get('type'):
-                return result['type']
-        return None
-
-    def _find_impl_class(self, session, interface_name, repo_prefix):
-        """Find implementation class for an interface."""
-        result = session.run("""
-            MATCH (impl:Class)-[:INHERITS]->(iface {name: $iface})
-            WHERE impl.path STARTS WITH $repo
-            RETURN impl.name AS name LIMIT 1
-        """, iface=interface_name, repo=repo_prefix).single()
-        return result['name'] if result else None
     def _create_function_calls(self, session, file_data: Dict, imports_map: dict):
         """Create CALLS relationships with a unified, prioritized logic flow for all call types."""
         caller_file_path = str(Path(file_data['path']).resolve())
@@ -1197,6 +1094,10 @@ class GraphBuilder:
         local_imports = {imp.get('alias') or imp['name'].split('.')[-1]: imp['name'] 
                         for imp in file_data.get('imports', [])}
         
+        # Build Tier 2 type environment for this file
+        repo_path_str = str(Path(file_data.get('repo_path', caller_file_path)).resolve()) + "/"
+        type_env = build_local_type_env(file_data, session, repo_path_str)
+        
         # Check if we should skip external resolution attempts - 
         skip_external = (get_config_value("SKIP_EXTERNAL_RESOLUTION") or "false").lower() == "true"
         
@@ -1207,7 +1108,7 @@ class GraphBuilder:
 
             resolved_path = None
             full_call = call.get('full_name', called_name)
-            base_obj = full_call.split('.')[0] if '.' in full_call else None
+            base_obj = full_call.split('.')[0].rstrip('()') if '.' in full_call else None
             
             # For chained calls like self.graph_builder.method(), we need to look up 'method'
             # For direct calls like self.method(), we can use the caller's file
@@ -1334,9 +1235,31 @@ class GraphBuilder:
                     # Try inheritance chain resolution before falling back to multi-candidate
                     resolved_via_chain = False
                     full_call = call.get('full_name', called_name)
-                    base_obj = full_call.split('.')[0] if '.' in full_call else None
+                    base_obj = full_call.split('.')[0].rstrip('()') if '.' in full_call else None
                     lang = file_data.get('lang', 'java')
-                    class_ctx = call.get('class_context') or (call.get('context', [None, None, None])[0] if call.get('context') else None)
+
+                    # Determine class context: find which class contains the caller method
+                    class_ctx = None
+                    ctx = call.get('context')
+                    if ctx and ctx[0]:
+                        method_name_ctx = ctx[0]
+                        call_line = call.get('line_number', 0)
+                        # Find the function whose line range contains this call
+                        best_fn = None
+                        for fn in file_data.get('functions', []):
+                            if fn.get('name') == method_name_ctx:
+                                fn_start = fn.get('line_number', 0)
+                                fn_end = fn.get('end_line', fn_start)
+                                if fn_start <= call_line <= fn_end:
+                                    best_fn = fn
+                                    break
+                                elif not best_fn:
+                                    best_fn = fn
+                        if best_fn:
+                            fn_ctx = best_fn.get('context')
+                            class_ctx = fn_ctx if isinstance(fn_ctx, str) else (fn_ctx[0] if fn_ctx else None)
+                        if not class_ctx and len(file_data.get('classes', [])) == 1:
+                            class_ctx = file_data['classes'][0].get('name')
 
                     if base_obj and base_obj not in ('self', 'this', 'super', 'cls'):
                         receiver_type = None
@@ -1345,10 +1268,46 @@ class GraphBuilder:
                             if field.get('name') == base_obj:
                                 receiver_type = field.get('type')
                                 break
+                        # Check local variables (e.g. decorated = MetricsDecorator(...))
+                        if not receiver_type:
+                            caller_ctx = call.get('context')
+                            caller_fn = caller_ctx[0] if caller_ctx else None
+                            for v in file_data.get('variables', []):
+                                if v.get('name') == base_obj and v.get('context') == caller_fn:
+                                    vtype = v.get('type')
+                                    if not vtype and v.get('value'):
+                                        # Python: extract type from value like "MetricsDecorator(real)"
+                                        val = v['value'].split('(')[0].strip()
+                                        if val and val[0].isupper():
+                                            vtype = val
+                                    if vtype:
+                                        receiver_type = vtype
+                                        break
+                            if not receiver_type:
+                                for v in file_data.get('variables', []):
+                                    if v.get('name') == base_obj:
+                                        vtype = v.get('type')
+                                        if not vtype and v.get('value'):
+                                            val = v['value'].split('(')[0].strip()
+                                            if val and val[0].isupper():
+                                                vtype = val
+                                        if vtype:
+                                            receiver_type = vtype
+                                            break
                         # If not found, check inherited fields using class context
                         if not receiver_type and class_ctx:
-                            receiver_type = self._find_field_type_in_hierarchy(
+                            receiver_type = find_field_type_in_hierarchy(
                                 session, class_ctx, base_obj, repo_path_prefix, lang)
+                        # Tier 2: type_env lookup (copy propagation + callResult)
+                        if not receiver_type:
+                            caller_scope = call.get('context', (None,))[0] or ''
+                            receiver_type = type_env.get((caller_scope, base_obj)) or type_env.get(('', base_obj))
+                        # Go explicit receiver: r.AuthHandler.Handle → AuthHandler is the type
+                        if not receiver_type and full_call.count('.') >= 2 and lang == 'go':
+                            parts = full_call.split('.')
+                            mid = parts[1]  # r.AuthHandler.Handle → AuthHandler
+                            if mid[0:1].isupper():
+                                receiver_type = mid
                     elif base_obj in ('self', 'this', 'cls') and full_call.count('.') >= 2:
                         # Python/JS: self.field.method() → extract field name
                         parts = full_call.split('.')
@@ -1367,7 +1326,7 @@ class GraphBuilder:
                                     break
                         # Check inherited fields
                         if not receiver_type and class_ctx:
-                            receiver_type = self._find_field_type_in_hierarchy(
+                            receiver_type = find_field_type_in_hierarchy(
                                 session, class_ctx, field_name, repo_path_prefix, lang)
                         # Last resort: heuristic — match ClassName() in __init__ to field name
                         if not receiver_type and class_ctx:
@@ -1381,28 +1340,60 @@ class GraphBuilder:
                                         break
                     else:
                         receiver_type = None
+                        # self/this/super.method() or bare method() in Java — try hierarchy
+                        if (base_obj in ('self', 'this', 'super') or base_obj is None) and class_ctx:
+                            if base_obj == 'super':
+                                # super.method() → skip current class, search parents
+                                ancestors = linear_ancestors(session, class_ctx, repo_path_prefix) if lang != 'python' else compute_mro(session, class_ctx, repo_path_prefix)
+                                # Remove self from ancestors, start from parent
+                                if ancestors and ancestors[0] == class_ctx:
+                                    ancestors = ancestors[1:]
+                                result = None
+                                for anc in ancestors:
+                                    result = session.run("""
+                                        MATCH (c {name: $cls})-[:CONTAINS]->(f:Function {name: $fn})
+                                        WHERE (c:Class OR c:Interface) AND c.path STARTS WITH $repo
+                                        RETURN f.path AS path, f.line_number AS line_number
+                                        LIMIT 1
+                                    """, cls=anc, fn=called_name, repo=repo_path_prefix).single()
+                                    if result:
+                                        result = {'path': result['path'], 'line_number': result['line_number']}
+                                        break
+                            else:
+                                result = find_method_in_hierarchy(
+                                    session, class_ctx, called_name, repo_path_prefix, lang, arg_count=len(call.get('args', [])))
+                            if result:
+                                self._safe_run_create(session, f"""
+                                    MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_file_path, line_number: $caller_line_number}})
+                                    MATCH (target:Function {{name: $called_name, path: $target_path, line_number: $target_line}})
+                                    MERGE (caller)-[:CALLS {{line_number: $line_number, args: $args,
+                                           full_call_name: $full_call_name,
+                                           confidence: 0.70, resolved_by: 'inherits_chain_found'}}]->(target)
+                                """, {**call_params, 'target_path': result['path'], 'target_line': result.get('line_number', result.get('tline', 0)),
+                                      'confidence': 0.70, 'resolved_by': 'inherits_chain_found'})
+                                resolved_via_chain = True
 
                     if receiver_type:
                             # Strip generics
                             clean_type = receiver_type.split('<')[0].strip()
                             # Try to find method in receiver's hierarchy
-                            result = self._find_method_in_hierarchy(
-                                session, clean_type, called_name, repo_path_prefix, lang)
+                            result = find_method_in_hierarchy(
+                                session, clean_type, called_name, repo_path_prefix, lang, arg_count=len(call.get("args", [])))
                             if not result:
                                 # Try implementation class (interface → impl)
-                                impl = self._find_impl_class(session, clean_type, repo_path_prefix)
+                                impl = find_impl_class(session, clean_type, repo_path_prefix)
                                 if impl:
-                                    result = self._find_method_in_hierarchy(
-                                        session, impl, called_name, repo_path_prefix, lang)
+                                    result = find_method_in_hierarchy(
+                                        session, impl, called_name, repo_path_prefix, lang, arg_count=len(call.get("args", [])))
                             if result:
                                 # Found via chain — create single precise CALLS
                                 self._safe_run_create(session, f"""
-                                    MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_file_path}})
-                                    MATCH (target:Function {{name: $called_name, path: $target_path}})
+                                    MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_file_path, line_number: $caller_line_number}})
+                                    MATCH (target:Function {{name: $called_name, path: $target_path, line_number: $target_line}})
                                     MERGE (caller)-[:CALLS {{line_number: $line_number, args: $args,
                                            full_call_name: $full_call_name,
                                            confidence: 0.70, resolved_by: 'inherits_chain_found'}}]->(target)
-                                """, {**call_params, 'target_path': result['path'],
+                                """, {**call_params, 'target_path': result['path'], 'target_line': result.get('line_number', result.get('tline', 0)),
                                       'confidence': 0.70, 'resolved_by': 'inherits_chain_found'})
                                 resolved_via_chain = True
 
@@ -1411,10 +1402,11 @@ class GraphBuilder:
                         self._create_multi_candidate_calls(
                             session, caller_label, caller_name, caller_file_path,
                             called_name, repo_path_prefix,
-                            call['line_number'], call.get('args', []), call.get('full_name', called_name)
+                            call['line_number'], call.get('args', []), call.get('full_name', called_name),
+                            caller_line=caller_line_number
                         )
                 elif not self._safe_run_create(session, f"""
-                    MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_file_path}})
+                    MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_file_path, line_number: $caller_line_number}})
                     OPTIONAL MATCH (tf:Function {{name: $called_name, path: $called_file_path}})
                     OPTIONAL MATCH (tc:Class {{name: $called_name, path: $called_file_path}})
                     OPTIONAL MATCH (tc)-[:CONTAINS]->(init:Function)
@@ -1424,12 +1416,118 @@ class GraphBuilder:
                     MERGE (caller)-[:CALLS {{line_number: $line_number, args: $args, full_call_name: $full_call_name, confidence: $confidence, resolved_by: $resolved_by}}]->(target)
                     RETURN count(*) as created
                 """, call_params):
-                    # Fallback: create CALLS to ALL matching targets
-                    self._create_multi_candidate_calls(
-                        session, caller_label, caller_name, caller_file_path,
-                        called_name, repo_path_prefix,
-                        call['line_number'], call.get('args', []), call.get('full_name', called_name)
-                    )
+                    # Before multi-candidate fallback, try hierarchy resolution
+                    chain_resolved = False
+                    full_call = call.get('full_name', called_name)
+                    base_obj = full_call.split('.')[0].rstrip('()') if '.' in full_call else None
+                    if base_obj in ('self', 'this', 'super') or base_obj is None:
+                        ctx = call.get('context')
+                        if ctx and ctx[0]:
+                            cls_ctx = None
+                            call_line = call.get('line_number', 0)
+                            best_fn = None
+                            for fn in file_data.get('functions', []):
+                                if fn.get('name') == ctx[0]:
+                                    fn_start = fn.get('line_number', 0)
+                                    fn_end = fn.get('end_line', fn_start)
+                                    if fn_start <= call_line <= fn_end:
+                                        best_fn = fn
+                                        break
+                                    elif not best_fn:
+                                        best_fn = fn
+                            if best_fn:
+                                fn_ctx = best_fn.get('context')
+                                cls_ctx = fn_ctx if isinstance(fn_ctx, str) else (fn_ctx[0] if fn_ctx else None)
+                            if not cls_ctx and len(file_data.get('classes', [])) == 1:
+                                cls_ctx = file_data['classes'][0].get('name')
+                            if cls_ctx:
+                                lang = file_data.get('lang', 'java')
+                                if base_obj == 'super':
+                                    ancestors = linear_ancestors(session, cls_ctx, repo_path_prefix) if lang != 'python' else compute_mro(session, cls_ctx, repo_path_prefix)
+                                    if ancestors and ancestors[0] == cls_ctx:
+                                        ancestors = ancestors[1:]
+                                    result = None
+                                    for anc in ancestors:
+                                        r = session.run("""
+                                            MATCH (c {name: $cls})-[:CONTAINS]->(f:Function {name: $fn})
+                                            WHERE (c:Class OR c:Interface) AND c.path STARTS WITH $repo
+                                            RETURN f.path AS path, f.line_number AS line_number LIMIT 1
+                                        """, cls=anc, fn=called_name, repo=repo_path_prefix).single()
+                                        if r:
+                                            result = {'path': r['path'], 'line_number': r['line_number']}
+                                            break
+                                else:
+                                    result = find_method_in_hierarchy(
+                                        session, cls_ctx, called_name, repo_path_prefix, lang, arg_count=len(call.get('args', [])))
+                                if result:
+                                    self._safe_run_create(session, f"""
+                                        MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_file_path, line_number: $caller_line_number}})
+                                        MATCH (target:Function {{name: $called_name, path: $target_path, line_number: $target_line}})
+                                        MERGE (caller)-[:CALLS {{line_number: $line_number, args: $args,
+                                               full_call_name: $full_call_name,
+                                               confidence: 0.70, resolved_by: 'inherits_chain_found'}}]->(target)
+                                    """, {**call_params, 'target_path': result['path'],
+                                          'target_line': result.get('line_number', 0),
+                                          'confidence': 0.70, 'resolved_by': 'inherits_chain_found'})
+                                    chain_resolved = True
+                    if not chain_resolved and base_obj and base_obj not in ('self', 'this', 'super', 'cls'):
+                        # Try local variable type lookup
+                        recv_type = None
+                        ctx = call.get('context')
+                        caller_fn = ctx[0] if ctx else None
+                        for v in file_data.get('variables', []):
+                            if v.get('name') == base_obj:
+                                vtype = v.get('type')
+                                if not vtype and v.get('value'):
+                                    val = v['value'].split('(')[0].strip()
+                                    if val and val[0:1].isupper():
+                                        vtype = val
+                                if vtype and (v.get('context') == caller_fn or not caller_fn):
+                                    recv_type = vtype
+                                    break
+                        if not recv_type:
+                            for v in file_data.get('variables', []):
+                                if v.get('name') == base_obj:
+                                    vtype = v.get('type')
+                                    if not vtype and v.get('value'):
+                                        val = v['value'].split('(')[0].strip()
+                                        if val and val[0:1].isupper():
+                                            vtype = val
+                                    if vtype:
+                                        recv_type = vtype
+                                        break
+                        # Tier 2: type_env fallback
+                        if not recv_type:
+                            caller_scope = ctx[0] if ctx else ''
+                            recv_type = type_env.get((caller_scope, base_obj)) or type_env.get(('', base_obj))
+                        if recv_type:
+                            clean = recv_type.split('<')[0].strip()
+                            ac = len(call.get('args', []))
+                            result = find_method_in_hierarchy(
+                                session, clean, called_name, repo_path_prefix, file_data.get('lang', 'java'), arg_count=ac)
+                            if not result:
+                                impl = find_impl_class(session, clean, repo_path_prefix)
+                                if impl:
+                                    result = find_method_in_hierarchy(
+                                        session, impl, called_name, repo_path_prefix, file_data.get('lang', 'java'), arg_count=ac)
+                            if result:
+                                self._safe_run_create(session, f"""
+                                    MATCH (caller:{caller_label} {{name: $caller_name, path: $caller_file_path, line_number: $caller_line_number}})
+                                    MATCH (target:Function {{name: $called_name, path: $target_path, line_number: $target_line}})
+                                    MERGE (caller)-[:CALLS {{line_number: $line_number, args: $args,
+                                           full_call_name: $full_call_name,
+                                           confidence: 0.75, resolved_by: 'local_var_type'}}]->(target)
+                                """, {**call_params, 'target_path': result['path'],
+                                      'target_line': result.get('line_number', 0),
+                                      'confidence': 0.75, 'resolved_by': 'local_var_type'})
+                                chain_resolved = True
+                    if not chain_resolved:
+                        self._create_multi_candidate_calls(
+                            session, caller_label, caller_name, caller_file_path,
+                            called_name, repo_path_prefix,
+                            call['line_number'], call.get('args', []), call.get('full_name', called_name),
+                            caller_line=caller_line_number
+                        )
             else:
                 # File-level calls
                 repo_path_prefix = str(Path(file_data.get('repo_path', caller_file_path)).resolve()) + "/"
@@ -1537,30 +1635,37 @@ class GraphBuilder:
                 
                 # If a path was found, create the relationship
                 if resolved_path:
+                    inh_type = 'implements' if base_class_str in class_item.get('implements_bases', []) else 'extends'
                     session.run("""
                         MATCH (child:Class {name: $child_name, path: $path})
-                        MATCH (parent:Class {name: $parent_name, path: $resolved_parent_file_path})
-                        MERGE (child)-[:INHERITS]->(parent)
+                        MATCH (parent {name: $parent_name, path: $resolved_parent_file_path})
+                        WHERE parent:Class OR parent:Interface
+                        MERGE (child)-[r:INHERITS]->(parent)
+                        SET r.type = $inh_type
                     """,
                     child_name=class_item['name'],
                     path=caller_file_path,
                     parent_name=target_class_name,
-                    resolved_parent_file_path=resolved_path)
+                    resolved_parent_file_path=resolved_path,
+                    inh_type=inh_type)
                 else:
                     # DB fallback: search within same repo when imports_map fails
                     repo_prefix = str(Path(file_data.get('repo_path', caller_file_path)).resolve()) + "/"
                     # Strip generic type params: BaseDao<User> → BaseDao
                     clean_name = target_class_name.split('<')[0].split('(')[0].strip()
+                    inh_type = 'implements' if base_class_str in class_item.get('implements_bases', []) else 'extends'
                     session.run("""
                         MATCH (child:Class {name: $child_name, path: $child_path})
                         MATCH (parent) WHERE (parent:Class OR parent:Interface) AND parent.name = $parent_name
                         AND parent.path STARTS WITH $repo_prefix
-                        MERGE (child)-[:INHERITS]->(parent)
+                        MERGE (child)-[r:INHERITS]->(parent)
+                        SET r.type = $inh_type
                     """,
                     child_name=class_item['name'],
                     child_path=caller_file_path,
                     parent_name=clean_name,
-                    repo_prefix=repo_prefix)
+                    repo_prefix=repo_prefix,
+                    inh_type=inh_type)
 
 
     def _create_csharp_inheritance_and_interfaces(self, session, file_data: Dict, imports_map: dict):
@@ -1645,25 +1750,8 @@ class GraphBuilder:
                     self.job_manager.update_job(job_id, processed_files=idx + 1)
 
             # Create OVERRIDES relationships from inheritance
-            self._create_overrides(session, all_file_data)
+            create_overrides(session, all_file_data)
 
-    def _create_overrides(self, session, all_file_data):
-        """Create OVERRIDES relationships: child.method → parent.method when both exist."""
-        try:
-            result = session.run("""
-                MATCH (child:Class)-[:INHERITS]->(parent:Class)
-                MATCH (child)-[:CONTAINS]->(cm:Function)
-                MATCH (parent)-[:CONTAINS]->(pm:Function)
-                WHERE cm.name = pm.name AND cm.name <> '__init__' AND cm.name <> 'constructor'
-                MERGE (cm)-[:OVERRIDES]->(pm)
-                RETURN count(*) AS created
-            """)
-            row = result.single()
-            count = row['created'] if row else 0
-            if count > 0:
-                info_logger(f"Created {count} OVERRIDES relationships")
-        except Exception as e:
-            debug_log(f"OVERRIDES creation failed: {e}")
                 
     def delete_file_from_graph(self, path: str):
         """Deletes a file and all its contained elements and relationships."""

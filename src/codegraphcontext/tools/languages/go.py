@@ -147,6 +147,7 @@ class GoTreeSitterParser:
         imports = self._find_imports(root_node)
         function_calls = self._find_calls(root_node)
         variables = self._find_variables(root_node)
+        field_declarations = self._extract_field_declarations(root_node, path)
 
         return {
             "path": str(path),
@@ -156,6 +157,7 @@ class GoTreeSitterParser:
             "variables": variables,
             "imports": imports,
             "function_calls": function_calls,
+            "field_declarations": field_declarations,
             "is_dependency": is_dependency,
             "lang": self.language_name,
         }
@@ -236,6 +238,8 @@ class GoTreeSitterParser:
                     "line_number": func_node.start_point[0] + 1,
                     "end_line": func_node.end_point[0] + 1,
                     "args": args,
+                    "parameter_types": self._extract_param_types(func_node),
+                    "return_type": self._extract_return_type(func_node),
                     "class_context": class_context,
                     "decorators": [],
                     "lang": self.language_name,
@@ -301,11 +305,28 @@ class GoTreeSitterParser:
                 struct_node = self._find_type_declaration_for_name(node)
                 if struct_node:
                     name = self._get_node_text(node)
+                    # Extract embedded types (fields with only type_identifier, no field name)
+                    bases = []
+                    for child in struct_node.children:
+                        if child.type == 'type_spec':
+                            for spec_child in child.children:
+                                if spec_child.type == 'struct_type':
+                                    for body_child in spec_child.children:
+                                        if body_child.type == 'field_declaration_list':
+                                            for field in body_child.children:
+                                                if field.type == 'field_declaration':
+                                                    child_types = [c.type for c in field.children]
+                                                    if child_types == ['type_identifier']:
+                                                        bases.append(self._get_node_text(field.children[0]))
+                                                    elif 'pointer_type' in child_types and 'field_identifier' not in child_types:
+                                                        pt = next(c for c in field.children if c.type == 'pointer_type')
+                                                        bases.append(self._get_node_text(pt).lstrip('*'))
                     class_data = {
                         "name": name,
                         "line_number": struct_node.start_point[0] + 1,
                         "end_line": struct_node.end_point[0] + 1,
-                        "bases": [],
+                        "bases": bases,
+                        "class_type": "struct",
                         "decorators": [],
                         "lang": self.language_name,
                         "is_dependency": False,
@@ -430,13 +451,54 @@ class GoTreeSitterParser:
         for node, capture_name in execute_query(self.language, query_str, root_node):
             if capture_name == 'name':
                 name = self._get_node_text(node)
+                var_type = None
+                value = None
+                context = None
+                # Try to get value and infer type from short_var_declaration
+                decl = node.parent  # expression_list
+                if decl and decl.type == 'expression_list':
+                    decl = decl.parent  # short_var_declaration
+                if decl and decl.type in ('short_var_declaration', 'var_spec'):
+                    # Get enclosing function for context
+                    p = decl.parent
+                    while p:
+                        if p.type in ('function_declaration', 'method_declaration'):
+                            fn = p.child_by_field_name('name')
+                            if fn:
+                                context = self._get_node_text(fn)
+                            break
+                        p = p.parent
+                    # Get right side value — in short_var_declaration, right is expression_list
+                    right_list = None
+                    for child in decl.children:
+                        if child.type == 'expression_list' and child != node.parent:
+                            right_list = child
+                    if right_list:
+                        for rchild in right_list.children:
+                            if rchild.type == 'call_expression':
+                                value = self._get_node_text(rchild)
+                                func = rchild.child_by_field_name('function')
+                                if func:
+                                    fn_name = self._get_node_text(func)
+                                    if fn_name.startswith('New') and len(fn_name) > 3:
+                                        var_type = fn_name[3:]
+                            elif rchild.type == 'unary_expression':
+                                value = self._get_node_text(rchild)
+                                inner = value
+                                if inner.startswith('&') and '{' in inner:
+                                    var_type = inner[1:].split('{')[0].strip()
+                            elif rchild.type == 'composite_literal':
+                                value = self._get_node_text(rchild)
+                                t = rchild.child_by_field_name('type')
+                                if t:
+                                    var_type = self._get_node_text(t)
                 
                 variable_data = {
                     "name": name,
                     "line_number": node.start_point[0] + 1,
-                    "value": None,
-                    "type": None,
-                    "context": None,
+                    "value": value,
+                    "type": var_type,
+                    "context": context,
                     "class_context": None,
                     "lang": self.language_name,
                     "is_dependency": False,
@@ -444,6 +506,64 @@ class GoTreeSitterParser:
                 variables.append(variable_data)
         
         return variables
+
+    def _extract_param_types(self, func_node):
+        """Extract parameter types from Go function parameters."""
+        params = func_node.child_by_field_name('parameters')
+        if not params:
+            return None
+        import json as json_mod
+        result = []
+        for child in params.children:
+            if child.type == 'parameter_declaration':
+                names, ptype = [], None
+                for c in child.children:
+                    if c.type == 'identifier':
+                        names.append(self._get_node_text(c))
+                    elif c.type not in (',',):
+                        ptype = self._get_node_text(c)
+                for n in names:
+                    result.append({"name": n, "type": ptype or "any"})
+        return json_mod.dumps(result) if result else None
+
+    def _extract_return_type(self, func_node):
+        """Extract return type from Go function."""
+        result = func_node.child_by_field_name('result')
+        if result:
+            return self._get_node_text(result)
+        return None
+
+    def _extract_field_declarations(self, root_node, path):
+        """Extract struct field declarations (non-embedded fields with types)."""
+        fields = []
+        query_str = GO_QUERIES['structs']
+        for node, capture_name in execute_query(self.language, query_str, root_node):
+            if capture_name == 'name':
+                struct_node = self._find_type_declaration_for_name(node)
+                if not struct_node:
+                    continue
+                class_name = self._get_node_text(node)
+                for child in struct_node.children:
+                    if child.type == 'type_spec':
+                        for spec_child in child.children:
+                            if spec_child.type == 'struct_type':
+                                for body_child in spec_child.children:
+                                    if body_child.type == 'field_declaration_list':
+                                        for field in body_child.children:
+                                            if field.type == 'field_declaration':
+                                                child_types = [c.type for c in field.children]
+                                                # Non-embedded: has field_identifier + type
+                                                if 'field_identifier' in child_types:
+                                                    fname, ftype = None, None
+                                                    for c in field.children:
+                                                        if c.type == 'field_identifier':
+                                                            fname = self._get_node_text(c)
+                                                        elif c.type not in ('field_identifier', 'tag'):
+                                                            ftype = self._get_node_text(c)
+                                                    if fname:
+                                                        fields.append({'name': fname, 'type': ftype, 'class_context': class_name,
+                                                                       'line_number': field.start_point[0] + 1, 'path': str(path), 'lang': self.language_name})
+        return fields
 
 def pre_scan_go(files: list[Path], parser_wrapper) -> dict:
     """Scans Go files to create a map of function/struct names to their file paths."""
